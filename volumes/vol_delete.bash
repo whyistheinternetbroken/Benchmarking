@@ -231,7 +231,7 @@ get_svm_volumes_json() {
   local svm_name=$1
   local encoded_svm
   encoded_svm=$(uri_encode "$svm_name")
-  api_request "GET" "https://$MGMT_IP/api/storage/volumes?svm.name=$encoded_svm&fields=uuid,name,size,space.used,state,nas.path,is_constituent&return_records=true&return_timeout=15&max_records=10000"
+  api_request "GET" "https://$MGMT_IP/api/storage/volumes?svm.name=$encoded_svm&is_constituent=false&fields=uuid,name,size,space.used,state,nas.path&return_records=true&return_timeout=15&max_records=10000"
 }
 
 bytes_to_tb() {
@@ -269,7 +269,6 @@ show_volumes() {
 
   rows=$(printf '%s' "$volumes_json" | jq -r '
     .records[]
-    | select((.is_constituent // false) == false)
     | [.name, (.size // 0 | tostring), (.space.used // 0 | tostring), (.state // "-"), (.nas.path // "-")]
     | @tsv
   ' | sort)
@@ -373,7 +372,6 @@ resolve_target_volumes() {
     fi
   done < <(printf '%s' "$volumes_json" | jq -r '
     .records[]
-    | select((.is_constituent // false) == false)
     | [.name, .uuid, (.state // "-"), (.nas.path // "-")]
     | @tsv
   ')
