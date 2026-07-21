@@ -224,6 +224,7 @@ show_created_volumes() {
     fi
   done <<< "$rows"
 
+  printf '\n'
   printf "%-${max_name_width}s | %-${max_style_width}s | %${max_size_width}s | %-${max_path_width}s\n" "$header_name" "$header_style" "$header_size" "$header_path"
   separator_width=$((max_name_width + max_style_width + max_size_width + max_path_width + 9))
   printf '%*s\n' "$separator_width" '' | tr ' ' '-'
@@ -232,6 +233,8 @@ show_created_volumes() {
     printf "%-${max_name_width}s | %-${max_style_width}s | %${max_size_width}s | %-${max_path_width}s\n" \
       "${row_names[$idx]}" "${row_styles[$idx]}" "${row_sizes[$idx]}" "${row_paths[$idx]}"
   done
+
+  printf '\n'
 }
 
 api_request() {
