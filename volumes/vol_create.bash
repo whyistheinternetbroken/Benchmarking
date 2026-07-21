@@ -16,6 +16,10 @@ is_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+is_non_negative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
 normalize_input() {
   printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
@@ -324,6 +328,34 @@ create_volume() {
   payload=$(build_payload "$volume_name")
   echo "Creating volume: $volume_name"
   api_request "POST" "https://$MGMT_IP/api/storage/volumes?return_timeout=0&return_records=false" "$payload" >/dev/null
+  wait_for_volume_ready "$volume_name"
+}
+
+wait_for_volume_ready() {
+  local volume_name=$1
+  local max_attempts=60
+  local attempt=1
+  local volumes_json
+  local current_size
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    volumes_json=$(api_request "GET" "https://$MGMT_IP/api/storage/volumes?fields=name,size&return_records=true&return_timeout=15")
+    current_size=$(printf '%s' "$volumes_json" | jq -r --arg volume_name "$volume_name" '
+      [.records[] | select(.name == $volume_name) | .size // empty][0] // empty
+    ')
+
+    if is_non_negative_integer "${current_size:-}"; then
+      if [ "$current_size" -eq "$VOL_SIZE_BYTES" ]; then
+        return
+      fi
+    fi
+
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+
+  echo "Timed out waiting for volume '$volume_name' to report expected size." >&2
+  exit 1
 }
 
 require_command curl
