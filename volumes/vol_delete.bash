@@ -172,7 +172,7 @@ api_request() {
 }
 
 get_data_svms_json() {
-  api_request "GET" "https://$MGMT_IP/api/svm/svms?fields=name,subtype,type&return_records=true&return_timeout=15&max_records=10000"
+  api_request "GET" "https://$MGMT_IP/api/svm/svms?fields=name,subtype&return_records=true&return_timeout=15&max_records=10000"
 }
 
 show_svms() {
@@ -181,15 +181,14 @@ show_svms() {
   local max_name_width
   local max_type_width
   local name
-  local type
   local subtype
   local header_name="SVM"
-  local header_type="Type/Subtype"
+  local header_type="Subtype"
   local separator_width
 
   rows=$(printf '%s' "$svms_json" | jq -r '
     .records[]
-    | [.name, ((.type // "-") + "/" + (.subtype // "-"))]
+    | [.name, (.subtype // "-")]
     | @tsv
   ' | sort)
 
@@ -201,12 +200,12 @@ show_svms() {
   max_name_width=${#header_name}
   max_type_width=${#header_type}
 
-  while IFS=$'\t' read -r name type; do
+  while IFS=$'\t' read -r name subtype; do
     if [ ${#name} -gt "$max_name_width" ]; then
       max_name_width=${#name}
     fi
-    if [ ${#type} -gt "$max_type_width" ]; then
-      max_type_width=${#type}
+    if [ ${#subtype} -gt "$max_type_width" ]; then
+      max_type_width=${#subtype}
     fi
   done <<< "$rows"
 
