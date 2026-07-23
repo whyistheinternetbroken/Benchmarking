@@ -398,23 +398,52 @@ get_nodes_json() {
 }
 
 get_ethernet_ports_json() {
-  api_request "GET" "https://$MGMT_IP/api/network/ethernet/ports?fields=name,node.name&return_records=true&return_timeout=15&max_records=10000"
+  api_request "GET" "https://$MGMT_IP/api/network/ethernet/ports?fields=name,node.name,role,broadcast_domain.name&return_records=true&return_timeout=15&max_records=10000"
 }
 
 load_node_ports() {
   local node_name=$1
+  local filter_broadcast_domain=${PORT_BROADCAST_DOMAIN_NAME:-}
 
   if [ -z "$ETHERNET_PORTS_JSON" ]; then
     ETHERNET_PORTS_JSON=$(get_ethernet_ports_json)
   fi
 
   mapfile -t NODE_PORT_NAMES < <(
-    printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" '
+    printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" --arg bd "$filter_broadcast_domain" '
       .records[]
       | select((.node.name // "") == $node)
+      | select((.role // "") == "data")
+      | select(($bd == "") or ((.broadcast_domain.name // "") == $bd))
       | .name // empty
     ' | sort
   )
+}
+
+show_available_ports() {
+  local node_name
+  local port_name
+  local found_any=false
+
+  echo
+  if [ -n "${PORT_BROADCAST_DOMAIN_NAME:-}" ]; then
+    echo "Available data ports in broadcast domain '$PORT_BROADCAST_DOMAIN_NAME':"
+  else
+    echo "Available data ports:"
+  fi
+
+  for node_name in "${TARGET_NODES[@]}"; do
+    load_node_ports "$node_name"
+    for port_name in "${NODE_PORT_NAMES[@]}"; do
+      echo "  - $node_name/$port_name"
+      found_any=true
+    done
+  done
+
+  if [ "$found_any" = "false" ]; then
+    echo "No matching data ports were returned by the API."
+  fi
+  echo
 }
 
 append_unique_value() {
@@ -503,25 +532,71 @@ validate_port_families_for_target_nodes() {
   fi
 
   for node_name in "${TARGET_NODES[@]}"; do
+    load_node_ports "$node_name"
     matched_count=0
-    while IFS= read -r port_name; do
-      [ -n "$port_name" ] || continue
+    for port_name in "${NODE_PORT_NAMES[@]}"; do
       for family in "${DATA_PORT_FAMILY_LIST[@]}"; do
         if [[ "$port_name" == "$family"* ]]; then
           matched_count=$((matched_count + 1))
           break
         fi
       done
-    done < <(
-      printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" '
-        .records[]
-        | select((.node.name // "") == $node)
-        | .name // empty
-      '
-    )
+    done
 
     if [ "$matched_count" -le 0 ]; then
       echo "No ports on node '$node_name' matched the requested port families: $DATA_PORT_FAMILIES" >&2
+      return 1
+    fi
+  done
+}
+
+validate_selected_ports_for_strategy() {
+  local node_index
+  local node_name
+  local selected_index
+
+  if [ "$USE_SAME_DATA_PORT" = "true" ]; then
+    if [ "${#DATA_PORT_LIST[@]}" -ne 1 ]; then
+      echo "Enter exactly one data port when using the same port on all nodes." >&2
+      return 1
+    fi
+
+    for node_name in "${TARGET_NODES[@]}"; do
+      if ! resolve_fixed_port_for_node "$node_name" "${DATA_PORT_LIST[0]}" >/dev/null; then
+        if [ -n "${PORT_BROADCAST_DOMAIN_NAME:-}" ]; then
+          echo "Port '${DATA_PORT_LIST[0]}' is not a data port in broadcast domain '$PORT_BROADCAST_DOMAIN_NAME' on node '$node_name'." >&2
+        else
+          echo "Port '${DATA_PORT_LIST[0]}' is not a data port on node '$node_name'." >&2
+        fi
+        return 1
+      fi
+    done
+    return 0
+  fi
+
+  if [ "$BALANCE_ACROSS_PORTS" = "true" ]; then
+    for node_name in "${TARGET_NODES[@]}"; do
+      if ! resolve_balancing_ports_for_node "$node_name"; then
+        if [ -n "${PORT_BROADCAST_DOMAIN_NAME:-}" ]; then
+          echo "The selected data ports did not match any ports in broadcast domain '$PORT_BROADCAST_DOMAIN_NAME' on node '$node_name'." >&2
+        else
+          echo "The selected data ports did not match any data ports on node '$node_name'." >&2
+        fi
+        return 1
+      fi
+    done
+    return 0
+  fi
+
+  for node_index in "${!TARGET_NODES[@]}"; do
+    node_name=${TARGET_NODES[$node_index]}
+    selected_index=$(( node_index % ${#DATA_PORT_LIST[@]} ))
+    if ! resolve_fixed_port_for_node "$node_name" "${DATA_PORT_LIST[$selected_index]}" >/dev/null; then
+      if [ -n "${PORT_BROADCAST_DOMAIN_NAME:-}" ]; then
+        echo "Port '${DATA_PORT_LIST[$selected_index]}' is not a data port in broadcast domain '$PORT_BROADCAST_DOMAIN_NAME' on node '$node_name'." >&2
+      else
+        echo "Port '${DATA_PORT_LIST[$selected_index]}' is not a data port on node '$node_name'." >&2
+      fi
       return 1
     fi
   done
@@ -617,7 +692,7 @@ get_all_node_names() {
 }
 
 get_subnets_json() {
-  api_request "GET" "https://$MGMT_IP/api/network/ip/subnets?fields=name&return_records=true&return_timeout=15&max_records=10000"
+  api_request "GET" "https://$MGMT_IP/api/network/ip/subnets?fields=name,broadcast_domain.name&return_records=true&return_timeout=15&max_records=10000"
 }
 
 get_broadcast_domains_json() {
@@ -693,6 +768,17 @@ subnet_exists() {
   local count
   count=$(printf '%s' "$subnets_json" | jq -r --arg subnet "$subnet_name" '[.records[] | select(.name == $subnet)] | length')
   [ "$count" -gt 0 ]
+}
+
+get_subnet_broadcast_domain_name() {
+  local subnet_name=$1
+  local subnets_json=$2
+
+  printf '%s' "$subnets_json" | jq -r --arg subnet "$subnet_name" '
+    .records[]
+    | select(.name == $subnet)
+    | .broadcast_domain.name // empty
+  ' | head -n 1
 }
 
 broadcast_domain_exists() {
@@ -1096,6 +1182,7 @@ prompt_subnet_name() {
     fi
 
     SUBNET_NAME=$input_value
+    BROADCAST_DOMAIN_NAME=$(get_subnet_broadcast_domain_name "$SUBNET_NAME" "$subnets_json")
     return
   done
 }
@@ -1423,21 +1510,12 @@ select_port_for_plan() {
       echo "Port family balancing is enabled, but DATA_PORT_FAMILIES is empty or invalid." >&2
       exit 1
     fi
-    if [ -z "$ETHERNET_PORTS_JSON" ]; then
-      ETHERNET_PORTS_JSON=$(get_ethernet_ports_json)
-    fi
-    mapfile -t NODE_PORT_FAMILY_MATCHES < <(
-      printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" '
-        .records[]
-        | select((.node.name // "") == $node)
-        | .name // empty
-      ' | sort
-    )
+    load_node_ports "$node_name"
 
     MATCHED_PORTS=()
     local port_name
     local family
-    for port_name in "${NODE_PORT_FAMILY_MATCHES[@]}"; do
+    for port_name in "${NODE_PORT_NAMES[@]}"; do
       for family in "${DATA_PORT_FAMILY_LIST[@]}"; do
         if [[ "$port_name" == "$family"* ]]; then
           MATCHED_PORTS+=("$port_name")
@@ -1654,6 +1732,12 @@ prompt_data_port_strategy() {
   local data_port_families_input
   local default_port_value
 
+  if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+    PORT_BROADCAST_DOMAIN_NAME=${BROADCAST_DOMAIN_NAME:-}
+  else
+    PORT_BROADCAST_DOMAIN_NAME=""
+  fi
+
   while true; do
     print_hint "Type B to go back to previous question."
     read -r -p "Use the same data port on all nodes? [y/N]: " same_port_choice
@@ -1669,6 +1753,7 @@ prompt_data_port_strategy() {
         USE_PORT_FAMILY_BALANCING=false
         DATA_PORT_FAMILIES=""
         while true; do
+          print_hint "Provide ? to list available data ports"
           print_hint "Type B to go back to previous question."
           default_port_value=""
           if validate_data_ports "$DATA_PORTS" >/dev/null 2>&1; then
@@ -1680,13 +1765,17 @@ prompt_data_port_strategy() {
             read -r -p "Enter data port name: " data_port_input
           fi
           data_port_input=$(normalize_input "$data_port_input")
+          if [ "$data_port_input" = "?" ]; then
+            show_available_ports
+            continue
+          fi
           if is_back_command "$data_port_input"; then
             break
           fi
           if [ -z "$data_port_input" ] && [ -n "$default_port_value" ]; then
             data_port_input=$default_port_value
           fi
-          if validate_data_ports "$data_port_input"; then
+          if validate_data_ports "$data_port_input" && validate_selected_ports_for_strategy; then
             DATA_PORTS=$data_port_input
             DATA_PORT_FAMILIES=""
             return
@@ -1725,6 +1814,7 @@ prompt_data_port_strategy() {
                     y|yes)
                       USE_PORT_FAMILY_BALANCING=true
                       while true; do
+                        print_hint "Provide ? to list available data ports"
                         print_hint "Type B to go back to previous question."
                         if [ -n "$DATA_PORT_FAMILIES" ]; then
                           read -r -p "Enter port families to balance across (comma-separated wildcard prefixes) [$DATA_PORT_FAMILIES]: " data_port_families_input
@@ -1732,6 +1822,10 @@ prompt_data_port_strategy() {
                           read -r -p "Enter port families to balance across (comma-separated wildcard prefixes): " data_port_families_input
                         fi
                         data_port_families_input=$(normalize_input "$data_port_families_input")
+                        if [ "$data_port_families_input" = "?" ]; then
+                          show_available_ports
+                          continue
+                        fi
                         if is_back_command "$data_port_families_input"; then
                           break
                         fi
@@ -1767,6 +1861,7 @@ prompt_data_port_strategy() {
             esac
 
             while true; do
+              print_hint "Provide ? to list available data ports"
               print_hint "Type B to go back to previous question."
               if [ -n "$DATA_PORTS" ]; then
                 read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b) [$DATA_PORTS]: " data_ports_input
@@ -1774,13 +1869,17 @@ prompt_data_port_strategy() {
                 read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b): " data_ports_input
               fi
               data_ports_input=$(normalize_input "$data_ports_input")
+              if [ "$data_ports_input" = "?" ]; then
+                show_available_ports
+                continue
+              fi
               if is_back_command "$data_ports_input"; then
                 break
               fi
               if [ -z "$data_ports_input" ] && [ -n "$DATA_PORTS" ]; then
                 data_ports_input=$DATA_PORTS
               fi
-              if validate_data_ports "$data_ports_input"; then
+              if validate_data_ports "$data_ports_input" && validate_selected_ports_for_strategy; then
                 DATA_PORTS=$data_ports_input
                 DATA_PORT_FAMILIES=""
                 return
@@ -1791,6 +1890,7 @@ prompt_data_port_strategy() {
           BALANCE_ACROSS_PORTS=false
           USE_PORT_FAMILY_BALANCING=false
           while true; do
+            print_hint "Provide ? to list available data ports"
             print_hint "Type B to go back to previous question."
             if [ -n "$DATA_PORTS" ]; then
               read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b) [$DATA_PORTS]: " data_ports_input
@@ -1798,13 +1898,17 @@ prompt_data_port_strategy() {
               read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b): " data_ports_input
             fi
             data_ports_input=$(normalize_input "$data_ports_input")
+            if [ "$data_ports_input" = "?" ]; then
+              show_available_ports
+              continue
+            fi
             if is_back_command "$data_ports_input"; then
               break
             fi
             if [ -z "$data_ports_input" ] && [ -n "$DATA_PORTS" ]; then
               data_ports_input=$DATA_PORTS
             fi
-            if validate_data_ports "$data_ports_input"; then
+            if validate_data_ports "$data_ports_input" && validate_selected_ports_for_strategy; then
               DATA_PORTS=$data_ports_input
               DATA_PORT_FAMILIES=""
               return
@@ -2102,23 +2206,9 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="ports"
-      elif [ "$rc" -eq 2 ]; then
-        wizard_step="nodes"
-      else
-        exit "$rc"
-      fi
-      ;;
-    ports)
-      if prompt_data_port_strategy; then
-        rc=0
-      else
-        rc=$?
-      fi
-      if [ "$rc" -eq 0 ]; then
         wizard_step="dynamic_subnet"
       elif [ "$rc" -eq 2 ]; then
-        wizard_step="multiplier"
+        wizard_step="nodes"
       else
         exit "$rc"
       fi
@@ -2136,7 +2226,7 @@ while true; do
           wizard_step="static_networking"
         fi
       elif [ "$rc" -eq 2 ]; then
-        wizard_step="ports"
+        wizard_step="multiplier"
       else
         exit "$rc"
       fi
@@ -2148,7 +2238,7 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="default_gateway"
+        wizard_step="ports"
       elif [ "$rc" -eq 2 ]; then
         wizard_step="dynamic_subnet"
       else
@@ -2162,9 +2252,27 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="default_gateway"
+        wizard_step="ports"
       elif [ "$rc" -eq 2 ]; then
         wizard_step="dynamic_subnet"
+      else
+        exit "$rc"
+      fi
+      ;;
+    ports)
+      if prompt_data_port_strategy; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="default_gateway"
+      elif [ "$rc" -eq 2 ]; then
+        if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+          wizard_step="subnet"
+        else
+          wizard_step="static_networking"
+        fi
       else
         exit "$rc"
       fi
@@ -2178,11 +2286,7 @@ while true; do
       if [ "$rc" -eq 0 ]; then
         wizard_step="confirm"
       elif [ "$rc" -eq 2 ]; then
-        if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
-          wizard_step="subnet"
-        else
-          wizard_step="static_networking"
-        fi
+        wizard_step="ports"
       else
         exit "$rc"
       fi
