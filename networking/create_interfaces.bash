@@ -14,6 +14,10 @@ require_command() {
   fi
 }
 
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
 normalize_input() {
   printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
@@ -287,12 +291,16 @@ node_exists() {
 prompt_node_name() {
   local var_name=$1
   local prompt_label=$2
+  local allow_all=${3:-false}
   local current_value=${!var_name:-}
   local input_value
   local nodes_json
 
   while true; do
     echo "Provide ? to list node names"
+    if [ "$allow_all" = "true" ]; then
+      echo "Type all to add LIFs to all nodes."
+    fi
     if [ -n "$current_value" ]; then
       read -r -p "$prompt_label [$current_value]: " input_value
     else
@@ -304,6 +312,13 @@ prompt_node_name() {
       nodes_json=$(get_nodes_json)
       show_nodes "$nodes_json"
       continue
+    fi
+
+    if [ "$allow_all" = "true" ]; then
+      if [ "${input_value,,}" = "all" ]; then
+        printf -v "$var_name" '%s' "__ALL__"
+        return
+      fi
     fi
 
     if [ -z "$input_value" ] && [ -n "$current_value" ]; then
@@ -322,6 +337,81 @@ prompt_node_name() {
     fi
 
     printf -v "$var_name" '%s' "$input_value"
+    return
+  done
+}
+
+get_all_node_names() {
+  local nodes_json=$1
+  printf '%s' "$nodes_json" | jq -r '.records[].name // empty' | sort
+}
+
+get_subnets_json() {
+  api_request "GET" "https://$MGMT_IP/api/network/ip/subnets?fields=name&return_records=true&return_timeout=15&max_records=10000"
+}
+
+show_subnets() {
+  local subnets_json=$1
+  local subnet_names
+
+  subnet_names=$(printf '%s' "$subnets_json" | jq -r '.records[].name // empty' | sort)
+  if [ -z "$subnet_names" ]; then
+    echo "No subnet names returned by the API."
+    return
+  fi
+
+  echo
+  echo "Available subnet names:"
+  while IFS= read -r subnet_name; do
+    echo "  - $subnet_name"
+  done <<< "$subnet_names"
+  echo
+}
+
+subnet_exists() {
+  local subnet_name=$1
+  local subnets_json=$2
+  local count
+  count=$(printf '%s' "$subnets_json" | jq -r --arg subnet "$subnet_name" '[.records[] | select(.name == $subnet)] | length')
+  [ "$count" -gt 0 ]
+}
+
+prompt_subnet_name() {
+  local current_value=${SUBNET_NAME:-}
+  local input_value
+  local subnets_json
+
+  while true; do
+    echo "Provide ? to list subnet names"
+    if [ -n "$current_value" ]; then
+      read -r -p "Enter subnet name [$current_value]: " input_value
+    else
+      read -r -p "Enter subnet name: " input_value
+    fi
+
+    input_value=$(normalize_input "$input_value")
+    if [ "$input_value" = "?" ]; then
+      subnets_json=$(get_subnets_json)
+      show_subnets "$subnets_json"
+      continue
+    fi
+
+    if [ -z "$input_value" ] && [ -n "$current_value" ]; then
+      input_value=$current_value
+    fi
+
+    if [ -z "$input_value" ]; then
+      echo "SUBNET_NAME is required." >&2
+      continue
+    fi
+
+    subnets_json=$(get_subnets_json)
+    if ! subnet_exists "$input_value" "$subnets_json"; then
+      echo "Subnet '$input_value' was not found. Type ? to list available subnet names." >&2
+      continue
+    fi
+
+    SUBNET_NAME=$input_value
     return
   done
 }
@@ -485,31 +575,19 @@ build_lif_name() {
   printf '%s_%s' "$LIF_PREFIX" "$ip_octet"
 }
 
-select_location_for_index() {
-  local idx=$1
-  local pattern=$((idx % 4))
-
-  case "$pattern" in
-    0)
-      SELECTED_NODE=$NODE1
-      SELECTED_PORT=$DATA_PORT1
-      ;;
-    1)
-      SELECTED_NODE=$NODE1
-      SELECTED_PORT=$DATA_PORT2
-      ;;
-    2)
-      SELECTED_NODE=$NODE2
-      SELECTED_PORT=$DATA_PORT1
-      ;;
-    *)
-      SELECTED_NODE=$NODE2
-      SELECTED_PORT=$DATA_PORT2
-      ;;
-  esac
+sanitize_node_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]/_/g'
 }
 
-build_payload() {
+build_lif_name_dynamic() {
+  local node_name=$1
+  local per_node_ordinal=$2
+  local safe_node
+  safe_node=$(sanitize_node_name "$node_name")
+  printf '%s_%s_%s' "$LIF_PREFIX" "$safe_node" "$per_node_ordinal"
+}
+
+build_payload_static() {
   local lif_name=$1
   local data_ip=$2
   local node_name=$3
@@ -537,7 +615,30 @@ build_payload() {
     }'
 }
 
-create_lif() {
+build_payload_dynamic() {
+  local lif_name=$1
+  local node_name=$2
+  local port_name=$3
+
+  jq -n \
+    --arg lif_name "$lif_name" \
+    --arg svm_name "$SVM" \
+    --arg subnet_name "$SUBNET_NAME" \
+    --arg node_name "$node_name" \
+    --arg port_name "$port_name" \
+    '{
+      name: $lif_name,
+      scope: "svm",
+      svm: { name: $svm_name },
+      subnet: { name: $subnet_name },
+      location: {
+        home_node: $node_name,
+        home_port: $port_name
+      }
+    }'
+}
+
+create_lif_static() {
   local data_ip=$1
   local node_name=$2
   local port_name=$3
@@ -545,9 +646,21 @@ create_lif() {
   local payload
 
   lif_name=$(build_lif_name "$data_ip")
-  payload=$(build_payload "$lif_name" "$data_ip" "$node_name" "$port_name")
+  payload=$(build_payload_static "$lif_name" "$data_ip" "$node_name" "$port_name")
 
   echo "Creating interface $lif_name with IP address $data_ip on $node_name/$port_name"
+  api_request "POST" "https://$MGMT_IP/api/network/ip/interfaces?return_timeout=0&return_records=false" "$payload" >/dev/null
+}
+
+create_lif_dynamic() {
+  local lif_name=$1
+  local node_name=$2
+  local port_name=$3
+  local payload
+
+  payload=$(build_payload_dynamic "$lif_name" "$node_name" "$port_name")
+
+  echo "Creating interface $lif_name from subnet $SUBNET_NAME on $node_name/$port_name"
   api_request "POST" "https://$MGMT_IP/api/network/ip/interfaces?return_timeout=0&return_records=false" "$payload" >/dev/null
 }
 
@@ -567,6 +680,9 @@ NODE2=${NODE2:-}
 DATA_PORT1=${DATA_PORT1:-}
 DATA_PORT2=${DATA_PORT2:-}
 DATA_IPS=${DATA_IPS:-}
+SUBNET_NAME=${SUBNET_NAME:-}
+LIFS_PER_NODE=${LIFS_PER_NODE:-${MULTIPLIER:-1}}
+USE_SUBNET_DYNAMIC=${USE_SUBNET_DYNAMIC:-false}
 DEFAULT_GATEWAY=${DEFAULT_GATEWAY:-${DATA_GATEWAY:-}}
 
 if [ -z "$DATA_IPS" ]; then
@@ -605,57 +721,158 @@ while true; do
   break
 done
 
-while true; do
-  if [ -n "$DATA_MASK" ]; then
-    read -r -p "Enter netmask in dotted decimal [$DATA_MASK]: " data_mask_input
-  else
-    read -r -p "Enter netmask in dotted decimal: " data_mask_input
+prompt_node_name NODE1 "Enter node 1 name" "true"
+if [ "$NODE1" = "__ALL__" ]; then
+  nodes_json=$(get_nodes_json)
+  TARGET_NODES=()
+  while IFS= read -r node_name; do
+    if [ -n "$node_name" ]; then
+      TARGET_NODES+=("$node_name")
+    fi
+  done < <(get_all_node_names "$nodes_json")
+  if [ "${#TARGET_NODES[@]}" -eq 0 ]; then
+    echo "No node names returned by the API." >&2
+    exit 1
   fi
-  data_mask_input=$(normalize_input "$data_mask_input")
-  if [ -z "$data_mask_input" ] && [ -n "$DATA_MASK" ]; then
-    data_mask_input=$DATA_MASK
-  fi
-  if ! is_valid_ipv4 "$data_mask_input"; then
-    echo "Netmask must be a valid dotted IPv4 value." >&2
-    continue
-  fi
-  DATA_MASK=$data_mask_input
-  break
-done
+else
+  prompt_node_name NODE2 "Enter node 2 name"
+  TARGET_NODES=("$NODE1" "$NODE2")
+fi
 
-prompt_node_name NODE1 "Enter node 1 name"
-prompt_node_name NODE2 "Enter node 2 name"
 prompt_if_empty DATA_PORT1 "Enter data port 1 name: "
 prompt_if_empty DATA_PORT2 "Enter data port 2 name: "
 
 while true; do
-  if [ -n "$DATA_IPS" ]; then
-    read -r -p "Enter data interface IPs (comma-separated) [$DATA_IPS]: " data_ips_input
+  if [ -n "$LIFS_PER_NODE" ]; then
+    read -r -p "Enter multiplier (number of LIFs per node) [$LIFS_PER_NODE]: " multiplier_input
   else
-    read -r -p "Enter data interface IPs (comma-separated): " data_ips_input
+    read -r -p "Enter multiplier (number of LIFs per node): " multiplier_input
   fi
-  data_ips_input=$(normalize_input "$data_ips_input")
-  if [ -z "$data_ips_input" ] && [ -n "$DATA_IPS" ]; then
-    data_ips_input=$DATA_IPS
+  multiplier_input=$(normalize_input "$multiplier_input")
+  if [ -z "$multiplier_input" ] && [ -n "$LIFS_PER_NODE" ]; then
+    multiplier_input=$LIFS_PER_NODE
   fi
-  if validate_data_ips "$data_ips_input"; then
-    DATA_IPS=$data_ips_input
+  if ! is_positive_integer "$multiplier_input"; then
+    echo "Multiplier must be a positive integer." >&2
+    continue
+  fi
+  LIFS_PER_NODE=$multiplier_input
+  break
+done
+
+while true; do
+  read -r -p "Use network subnets to provision IPs dynamically? [y/N]: " use_subnet_choice
+  use_subnet_choice=$(normalize_input "$use_subnet_choice")
+  use_subnet_choice=${use_subnet_choice,,}
+  case "$use_subnet_choice" in
+    y|yes)
+      USE_SUBNET_DYNAMIC=true
+      break
+      ;;
+    ""|n|no)
+      USE_SUBNET_DYNAMIC=false
+      break
+      ;;
+    *)
+      echo "Please enter y or n." >&2
+      ;;
+  esac
+done
+
+required_lif_count=$(( ${#TARGET_NODES[@]} * LIFS_PER_NODE ))
+if [ "$required_lif_count" -le 0 ]; then
+  echo "Calculated LIF count is invalid." >&2
+  exit 1
+fi
+
+if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+  prompt_subnet_name
+else
+  while true; do
+    if [ -n "$DATA_MASK" ]; then
+      read -r -p "Enter netmask in dotted decimal [$DATA_MASK]: " data_mask_input
+    else
+      read -r -p "Enter netmask in dotted decimal: " data_mask_input
+    fi
+    data_mask_input=$(normalize_input "$data_mask_input")
+    if [ -z "$data_mask_input" ] && [ -n "$DATA_MASK" ]; then
+      data_mask_input=$DATA_MASK
+    fi
+    if ! is_valid_ipv4 "$data_mask_input"; then
+      echo "Netmask must be a valid dotted IPv4 value." >&2
+      continue
+    fi
+    DATA_MASK=$data_mask_input
     break
-  fi
+  done
+
+  while true; do
+    if [ -n "$DATA_IPS" ]; then
+      read -r -p "Enter $required_lif_count data interface IPs (comma-separated) [$DATA_IPS]: " data_ips_input
+    else
+      read -r -p "Enter $required_lif_count data interface IPs (comma-separated): " data_ips_input
+    fi
+    data_ips_input=$(normalize_input "$data_ips_input")
+    if [ -z "$data_ips_input" ] && [ -n "$DATA_IPS" ]; then
+      data_ips_input=$DATA_IPS
+    fi
+    if validate_data_ips "$data_ips_input"; then
+      if [ "${#DATA_IP_LIST[@]}" -ne "$required_lif_count" ]; then
+        echo "Expected $required_lif_count IP addresses, but received ${#DATA_IP_LIST[@]}." >&2
+        continue
+      fi
+      DATA_IPS=$data_ips_input
+      break
+    fi
+  done
+fi
+
+PLANNED_NAMES=()
+PLANNED_NODES=()
+PLANNED_PORTS=()
+PLANNED_IPS=()
+
+plan_index=0
+for node_name in "${TARGET_NODES[@]}"; do
+  per_node_index=1
+  while [ "$per_node_index" -le "$LIFS_PER_NODE" ]; do
+    if [ $(((per_node_index - 1) % 2)) -eq 0 ]; then
+      selected_port=$DATA_PORT1
+    else
+      selected_port=$DATA_PORT2
+    fi
+
+    if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+      lif_name=$(build_lif_name_dynamic "$node_name" "$per_node_index")
+      ip_value="-"
+    else
+      ip_value=${DATA_IP_LIST[$plan_index]}
+      lif_name=$(build_lif_name "$ip_value")
+    fi
+
+    PLANNED_NAMES+=("$lif_name")
+    PLANNED_NODES+=("$node_name")
+    PLANNED_PORTS+=("$selected_port")
+    PLANNED_IPS+=("$ip_value")
+
+    plan_index=$((plan_index + 1))
+    per_node_index=$((per_node_index + 1))
+  done
 done
 
 echo
 echo "Interfaces to create in SVM '$SVM':"
-for idx in "${!DATA_IP_LIST[@]}"; do
-  data_ip=${DATA_IP_LIST[$idx]}
-  lif_name=$(build_lif_name "$data_ip")
-  select_location_for_index "$idx"
-  echo "  - $lif_name ($data_ip) on $SELECTED_NODE/$SELECTED_PORT"
+for idx in "${!PLANNED_NAMES[@]}"; do
+  if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+    echo "  - ${PLANNED_NAMES[$idx]} (subnet: $SUBNET_NAME) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
+  else
+    echo "  - ${PLANNED_NAMES[$idx]} (${PLANNED_IPS[$idx]}) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
+  fi
 done
 echo
 
 while true; do
-  read -r -p "Proceed to create ${#DATA_IP_LIST[@]} interface(s)? [y/N]: " confirm_create
+  read -r -p "Proceed to create ${#PLANNED_NAMES[@]} interface(s)? [y/N]: " confirm_create
   confirm_create=$(normalize_input "$confirm_create")
   confirm_create=${confirm_create,,}
   case "$confirm_create" in
@@ -672,11 +889,13 @@ while true; do
   esac
 done
 
-for idx in "${!DATA_IP_LIST[@]}"; do
-  data_ip=${DATA_IP_LIST[$idx]}
-  select_location_for_index "$idx"
-  create_lif "$data_ip" "$SELECTED_NODE" "$SELECTED_PORT"
+for idx in "${!PLANNED_NAMES[@]}"; do
+  if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+    create_lif_dynamic "${PLANNED_NAMES[$idx]}" "${PLANNED_NODES[$idx]}" "${PLANNED_PORTS[$idx]}"
+  else
+    create_lif_static "${PLANNED_IPS[$idx]}" "${PLANNED_NODES[$idx]}" "${PLANNED_PORTS[$idx]}"
+  fi
 done
 
 echo
-echo "Create requests submitted for ${#DATA_IP_LIST[@]} interface(s) in SVM '$SVM'."
+echo "Create requests submitted for ${#PLANNED_NAMES[@]} interface(s) in SVM '$SVM'."
