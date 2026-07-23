@@ -687,7 +687,7 @@ parse_ip_ranges_value() {
       echo "Each IP range start and end must be valid IPv4 addresses." >&2
       return 1
     fi
-    ranges_json=$(printf '%s' "$ranges_json" | jq --arg start "$range_start" --arg end "$range_end" '. + [{"start": $start, "end": $end}]')
+    ranges_json=$(printf '%s' "$ranges_json" | jq --arg range_start "$range_start" --arg range_end "$range_end" '. + [{"start": $range_start, "end": $range_end}]')
   done
 
   SUBNET_IP_RANGES_INPUT=$normalized_value
@@ -1647,9 +1647,9 @@ prompt_data_port_strategy() {
             while true; do
               print_hint "Type B to go back to previous question."
               if [ -n "$DATA_PORTS" ]; then
-                read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
+                read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b) [$DATA_PORTS]: " data_ports_input
               else
-                read -r -p "Enter data ports to use (comma-separated): " data_ports_input
+                read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b): " data_ports_input
               fi
               data_ports_input=$(normalize_input "$data_ports_input")
               if is_back_command "$data_ports_input"; then
@@ -1671,9 +1671,9 @@ prompt_data_port_strategy() {
           while true; do
             print_hint "Type B to go back to previous question."
             if [ -n "$DATA_PORTS" ]; then
-              read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
+              read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b) [$DATA_PORTS]: " data_ports_input
             else
-              read -r -p "Enter data ports to use (comma-separated): " data_ports_input
+              read -r -p "Enter data ports to use (comma-separated; use eN for all ports on a specific slot, such as e2 for e2a,e2b): " data_ports_input
             fi
             data_ports_input=$(normalize_input "$data_ports_input")
             if is_back_command "$data_ports_input"; then
