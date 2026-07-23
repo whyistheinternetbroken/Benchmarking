@@ -221,6 +221,10 @@ is_back_command() {
   [ "$value" = "b" ] || [ "$value" = "back" ]
 }
 
+print_hint() {
+  echo "  - $1"
+}
+
 get_data_svms_json() {
   api_request "GET" "https://$MGMT_IP/api/svm/svms?fields=name,subtype&return_records=true&return_timeout=15&max_records=10000"
 }
@@ -262,8 +266,8 @@ prompt_svm_name() {
   local svms_json
 
   while true; do
-    echo "Provide ? to list SVM names"
-    echo "Type B to go back to previous question."
+    print_hint "Provide ? to list SVM names"
+    print_hint "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
       read -r -p "Enter SVM name [$current_value]: " input_value
     else
@@ -367,8 +371,73 @@ validate_data_ports() {
   fi
 }
 
+validate_port_families() {
+  local raw_value=$1
+  local normalized
+  local entry
+
+  DATA_PORT_FAMILY_LIST=()
+  IFS=',' read -r -a raw_families <<< "$raw_value"
+
+  for entry in "${raw_families[@]}"; do
+    normalized=$(normalize_input "$entry")
+    if [ -z "$normalized" ]; then
+      continue
+    fi
+    DATA_PORT_FAMILY_LIST+=("$normalized")
+  done
+
+  if [ "${#DATA_PORT_FAMILY_LIST[@]}" -eq 0 ]; then
+    echo "At least one port family is required." >&2
+    return 1
+  fi
+}
+
 get_nodes_json() {
   api_request "GET" "https://$MGMT_IP/api/cluster/nodes?fields=name&return_records=true&return_timeout=15&max_records=10000"
+}
+
+get_ethernet_ports_json() {
+  api_request "GET" "https://$MGMT_IP/api/network/ethernet/ports?fields=name,node.name&return_records=true&return_timeout=15&max_records=10000"
+}
+
+validate_port_families_for_target_nodes() {
+  local node_name
+  local port_name
+  local family
+  local matched_count
+
+  if ! validate_port_families "$DATA_PORT_FAMILIES" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if [ -z "$ETHERNET_PORTS_JSON" ]; then
+    ETHERNET_PORTS_JSON=$(get_ethernet_ports_json)
+  fi
+
+  for node_name in "${TARGET_NODES[@]}"; do
+    matched_count=0
+    while IFS= read -r port_name; do
+      [ -n "$port_name" ] || continue
+      for family in "${DATA_PORT_FAMILY_LIST[@]}"; do
+        if [[ "$port_name" == "$family"* ]]; then
+          matched_count=$((matched_count + 1))
+          break
+        fi
+      done
+    done < <(
+      printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" '
+        .records[]
+        | select((.node.name // "") == $node)
+        | .name // empty
+      '
+    )
+
+    if [ "$matched_count" -le 0 ]; then
+      echo "No ports on node '$node_name' matched the requested port families: $DATA_PORT_FAMILIES" >&2
+      return 1
+    fi
+  done
 }
 
 show_nodes() {
@@ -406,10 +475,10 @@ prompt_node_name() {
   local nodes_json
 
   while true; do
-    echo "Provide ? to list node names"
-    echo "Type B to go back to previous question."
+    print_hint "Provide ? to list node names"
+    print_hint "Type B to go back to previous question."
     if [ "$allow_all" = "true" ]; then
-      echo "Type all to add LIFs to all nodes."
+      print_hint "Type all to add LIFs to all nodes."
     fi
     if [ -n "$current_value" ]; then
       read -r -p "$prompt_label [$current_value]: " input_value
@@ -618,7 +687,7 @@ parse_ip_ranges_value() {
       echo "Each IP range start and end must be valid IPv4 addresses." >&2
       return 1
     fi
-    ranges_json=$(printf '%s' "$ranges_json" | jq --arg start "$range_start" --arg end "$range_end" '. + [{start: $start, end: $end}]')
+    ranges_json=$(printf '%s' "$ranges_json" | jq --arg start "$range_start" --arg end "$range_end" '. + [{"start": $start, "end": $end}]')
   done
 
   SUBNET_IP_RANGES_INPUT=$normalized_value
@@ -632,8 +701,8 @@ prompt_broadcast_domain_name() {
   local broadcast_domains_json
 
   while true; do
-    echo "Provide ? to list broadcast domains"
-    echo "Type B to go back to previous question."
+    print_hint "Provide ? to list broadcast domains"
+    print_hint "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
       read -r -p "Enter broadcast domain name [$current_value]: " input_value
     else
@@ -675,8 +744,8 @@ prompt_ipspace_name_optional() {
   local ipspaces_json
 
   while true; do
-    echo "Provide ? to list IPspaces"
-    echo "Type B to go back to previous question."
+    print_hint "Provide ? to list IPspaces"
+    print_hint "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
       read -r -p "Enter IPspace name (optional) [$current_value]: " input_value
     else
@@ -746,7 +815,7 @@ prompt_and_create_subnet() {
   while true; do
     case "$subnet_step" in
       name)
-        echo "Type B to go back to previous question."
+        print_hint "Type B to go back to previous question."
         if [ -n "${SUBNET_NAME:-}" ]; then
           read -r -p "Enter new subnet name [$SUBNET_NAME]: " subnet_name_input
         else
@@ -781,7 +850,7 @@ prompt_and_create_subnet() {
         fi
         ;;
       subnet)
-        echo "Type B to go back to previous question."
+        print_hint "Type B to go back to previous question."
         if [ -n "${SUBNET_CIDR:-}" ]; then
           read -r -p "Enter subnet (for example 10.10.10.0/24) [$SUBNET_CIDR]: " subnet_value_input
         else
@@ -805,7 +874,7 @@ prompt_and_create_subnet() {
         fi
         ;;
       ip_ranges)
-        echo "Type B to go back to previous question."
+        print_hint "Type B to go back to previous question."
         if [ -n "${SUBNET_IP_RANGES_INPUT:-}" ]; then
           read -r -p "Enter ip-ranges (optional, example x.x.x.x-x.x.x.y) [$SUBNET_IP_RANGES_INPUT]: " subnet_ip_ranges_input
         else
@@ -835,7 +904,7 @@ prompt_and_create_subnet() {
         fi
         ;;
       gateway)
-        echo "Type B to go back to previous question."
+        print_hint "Type B to go back to previous question."
         if [ -n "${SUBNET_GATEWAY:-}" ]; then
           read -r -p "Enter subnet gateway IP (optional) [$SUBNET_GATEWAY]: " subnet_gateway_input
         else
@@ -864,9 +933,9 @@ prompt_subnet_name() {
   local subnets_json
 
   while true; do
-    echo "Provide ? to list subnet names"
-    echo "Type create to create a subnet."
-    echo "Type B to go back to previous question."
+    print_hint "Provide ? to list subnet names"
+    print_hint "Type create to create a subnet."
+    print_hint "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
       read -r -p "Enter subnet name [$current_value]: " input_value
     else
@@ -983,7 +1052,7 @@ ensure_default_gateway_for_svm() {
 
   echo "No default gateway route found for SVM '$SVM'."
   while true; do
-    echo "Type B to go back to previous question."
+    print_hint "Type B to go back to previous question."
     read -r -p "Would you like to add a default gateway route now? [y/N]: " add_gateway_choice
     add_gateway_choice=$(normalize_input "$add_gateway_choice")
     if is_back_command "$add_gateway_choice"; then
@@ -993,7 +1062,7 @@ ensure_default_gateway_for_svm() {
     case "$add_gateway_choice" in
       y|yes)
         while true; do
-          echo "Type B to go back to previous question."
+          print_hint "Type B to go back to previous question."
           if [ -n "${DEFAULT_GATEWAY:-}" ]; then
             read -r -p "Enter default gateway IP [$DEFAULT_GATEWAY]: " gateway_input
           else
@@ -1208,23 +1277,72 @@ build_lif_name_dynamic() {
 select_port_for_plan() {
   local node_index=$1
   local per_node_index=$2
+  local node_name=${TARGET_NODES[$node_index]}
   local port_count=${#DATA_PORT_LIST[@]}
   local selected_index
-
-  if [ "$port_count" -le 0 ]; then
-    echo "No data ports are available for planning." >&2
-    exit 1
-  fi
+  local family_port_count
 
   if [ "$USE_SAME_DATA_PORT" = "true" ]; then
+    if [ "$port_count" -le 0 ]; then
+      echo "No data ports are available for planning." >&2
+      exit 1
+    fi
     printf '%s' "${DATA_PORT_LIST[0]}"
     return
   fi
 
   if [ "$BALANCE_ACROSS_PORTS" = "true" ]; then
+    if [ "$port_count" -le 0 ]; then
+      echo "No data ports are available for planning." >&2
+      exit 1
+    fi
     selected_index=$(( (per_node_index - 1) % port_count ))
     printf '%s' "${DATA_PORT_LIST[$selected_index]}"
     return
+  fi
+
+  if [ "$USE_PORT_FAMILY_BALANCING" = "true" ]; then
+    if ! validate_port_families "$DATA_PORT_FAMILIES" >/dev/null 2>&1; then
+      echo "Port family balancing is enabled, but DATA_PORT_FAMILIES is empty or invalid." >&2
+      exit 1
+    fi
+    if [ -z "$ETHERNET_PORTS_JSON" ]; then
+      ETHERNET_PORTS_JSON=$(get_ethernet_ports_json)
+    fi
+    mapfile -t NODE_PORT_FAMILY_MATCHES < <(
+      printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" '
+        .records[]
+        | select((.node.name // "") == $node)
+        | .name // empty
+      ' | sort
+    )
+
+    MATCHED_PORTS=()
+    local port_name
+    local family
+    for port_name in "${NODE_PORT_FAMILY_MATCHES[@]}"; do
+      for family in "${DATA_PORT_FAMILY_LIST[@]}"; do
+        if [[ "$port_name" == "$family"* ]]; then
+          MATCHED_PORTS+=("$port_name")
+          break
+        fi
+      done
+    done
+
+    family_port_count=${#MATCHED_PORTS[@]}
+    if [ "$family_port_count" -le 0 ]; then
+      echo "No ports on node '$node_name' matched the requested port families: $DATA_PORT_FAMILIES" >&2
+      exit 1
+    fi
+
+    selected_index=$(( (per_node_index - 1) % family_port_count ))
+    printf '%s' "${MATCHED_PORTS[$selected_index]}"
+    return
+  fi
+
+  if [ "$port_count" -le 0 ]; then
+    echo "No data ports are available for planning." >&2
+    exit 1
   fi
 
   selected_index=$(( node_index % port_count ))
@@ -1312,7 +1430,7 @@ prompt_lif_prefix() {
   local lif_prefix_input
 
   while true; do
-    echo "Type B to go back to previous question."
+    print_hint "Type B to go back to previous question."
     if [ -n "$LIF_PREFIX" ]; then
       read -r -p "Enter LIF prefix [$LIF_PREFIX]: " lif_prefix_input
     else
@@ -1383,7 +1501,7 @@ prompt_multiplier_value() {
   local multiplier_input
 
   while true; do
-    echo "Type B to go back to previous question."
+    print_hint "Type B to go back to previous question."
     if [ -n "$LIFS_PER_NODE" ]; then
       read -r -p "Enter multiplier (number of LIFs per node) [$LIFS_PER_NODE]: " multiplier_input
     else
@@ -1408,12 +1526,14 @@ prompt_multiplier_value() {
 prompt_data_port_strategy() {
   local same_port_choice
   local balance_ports_choice
+  local balance_port_families_choice
   local data_port_input
   local data_ports_input
+  local data_port_families_input
   local default_port_value
 
   while true; do
-    echo "Type B to go back to previous question."
+    print_hint "Type B to go back to previous question."
     read -r -p "Use the same data port on all nodes? [y/N]: " same_port_choice
     same_port_choice=$(normalize_input "$same_port_choice")
     if is_back_command "$same_port_choice"; then
@@ -1424,8 +1544,10 @@ prompt_data_port_strategy() {
       y|yes)
         USE_SAME_DATA_PORT=true
         BALANCE_ACROSS_PORTS=false
+        USE_PORT_FAMILY_BALANCING=false
+        DATA_PORT_FAMILIES=""
         while true; do
-          echo "Type B to go back to previous question."
+          print_hint "Type B to go back to previous question."
           default_port_value=""
           if validate_data_ports "$DATA_PORTS" >/dev/null 2>&1; then
             default_port_value=${DATA_PORT_LIST[0]}
@@ -1444,6 +1566,7 @@ prompt_data_port_strategy() {
           fi
           if validate_data_ports "$data_port_input"; then
             DATA_PORTS=$data_port_input
+            DATA_PORT_FAMILIES=""
             return
           fi
         done
@@ -1452,7 +1575,7 @@ prompt_data_port_strategy() {
         USE_SAME_DATA_PORT=false
         if [ "$LIFS_PER_NODE" -gt 1 ]; then
           while true; do
-            echo "Type B to go back to previous question."
+            print_hint "Type B to go back to previous question."
             read -r -p "Balance interfaces across ports on each node? [y/N]: " balance_ports_choice
             balance_ports_choice=$(normalize_input "$balance_ports_choice")
             if is_back_command "$balance_ports_choice"; then
@@ -1462,9 +1585,58 @@ prompt_data_port_strategy() {
             case "$balance_ports_choice" in
               y|yes)
                 BALANCE_ACROSS_PORTS=true
+                USE_PORT_FAMILY_BALANCING=false
+                DATA_PORT_FAMILIES=""
                 ;;
               ""|n|no)
                 BALANCE_ACROSS_PORTS=false
+                while true; do
+                  print_hint "Type B to go back to previous question."
+                  read -r -p "Balance interfaces across specific port families (ie, e2 or e2,e4)? [y/N]: " balance_port_families_choice
+                  balance_port_families_choice=$(normalize_input "$balance_port_families_choice")
+                  if is_back_command "$balance_port_families_choice"; then
+                    balance_port_families_choice="__BACK__"
+                    break
+                  fi
+                  balance_port_families_choice=${balance_port_families_choice,,}
+                  case "$balance_port_families_choice" in
+                    y|yes)
+                      USE_PORT_FAMILY_BALANCING=true
+                      while true; do
+                        print_hint "Type B to go back to previous question."
+                        if [ -n "$DATA_PORT_FAMILIES" ]; then
+                          read -r -p "Enter port families to balance across (comma-separated wildcard prefixes) [$DATA_PORT_FAMILIES]: " data_port_families_input
+                        else
+                          read -r -p "Enter port families to balance across (comma-separated wildcard prefixes): " data_port_families_input
+                        fi
+                        data_port_families_input=$(normalize_input "$data_port_families_input")
+                        if is_back_command "$data_port_families_input"; then
+                          break
+                        fi
+                        if [ -z "$data_port_families_input" ] && [ -n "$DATA_PORT_FAMILIES" ]; then
+                          data_port_families_input=$DATA_PORT_FAMILIES
+                        fi
+                        if validate_port_families "$data_port_families_input"; then
+                          DATA_PORT_FAMILIES=$data_port_families_input
+                          DATA_PORTS=""
+                          if validate_port_families_for_target_nodes; then
+                            return
+                          fi
+                        fi
+                      done
+                      ;;
+                    ""|n|no)
+                      USE_PORT_FAMILY_BALANCING=false
+                      break
+                      ;;
+                    *)
+                      echo "Please enter y or n." >&2
+                      ;;
+                  esac
+                done
+                if [ "${balance_port_families_choice:-}" = "__BACK__" ]; then
+                  continue
+                fi
                 ;;
               *)
                 echo "Please enter y or n." >&2
@@ -1473,7 +1645,7 @@ prompt_data_port_strategy() {
             esac
 
             while true; do
-              echo "Type B to go back to previous question."
+              print_hint "Type B to go back to previous question."
               if [ -n "$DATA_PORTS" ]; then
                 read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
               else
@@ -1488,14 +1660,16 @@ prompt_data_port_strategy() {
               fi
               if validate_data_ports "$data_ports_input"; then
                 DATA_PORTS=$data_ports_input
+                DATA_PORT_FAMILIES=""
                 return
               fi
             done
           done
         else
           BALANCE_ACROSS_PORTS=false
+          USE_PORT_FAMILY_BALANCING=false
           while true; do
-            echo "Type B to go back to previous question."
+            print_hint "Type B to go back to previous question."
             if [ -n "$DATA_PORTS" ]; then
               read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
             else
@@ -1510,6 +1684,7 @@ prompt_data_port_strategy() {
             fi
             if validate_data_ports "$data_ports_input"; then
               DATA_PORTS=$data_ports_input
+              DATA_PORT_FAMILIES=""
               return
             fi
           done
@@ -1526,7 +1701,7 @@ prompt_subnet_dynamic_choice() {
   local use_subnet_choice
 
   while true; do
-    echo "Type B to go back to previous question."
+    print_hint "Type B to go back to previous question."
     read -r -p "Use network subnets to provision IPs dynamically? [y/N]: " use_subnet_choice
     use_subnet_choice=$(normalize_input "$use_subnet_choice")
     if is_back_command "$use_subnet_choice"; then
@@ -1567,7 +1742,7 @@ prompt_static_networking() {
   while true; do
     case "$static_step" in
       netmask)
-        echo "Type B to go back to previous question."
+        print_hint "Type B to go back to previous question."
         if [ -n "$DATA_MASK" ]; then
           read -r -p "Enter netmask in dotted decimal [$DATA_MASK]: " data_mask_input
         else
@@ -1588,7 +1763,7 @@ prompt_static_networking() {
         static_step="ips"
         ;;
       ips)
-        echo "Type B to go back to previous question."
+        print_hint "Type B to go back to previous question."
         if [ -n "$DATA_IPS" ]; then
           read -r -p "Enter $required_lif_count data interface IPs (comma-separated) [$DATA_IPS]: " data_ips_input
         else
@@ -1675,7 +1850,7 @@ prompt_creation_confirmation() {
   local confirm_create
 
   while true; do
-    echo "Type B to go back to previous question."
+    print_hint "Type B to go back to previous question."
     read -r -p "Proceed to create ${#PLANNED_NAMES[@]} interface(s)? [y/N]: " confirm_create
     confirm_create=$(normalize_input "$confirm_create")
     if is_back_command "$confirm_create"; then
@@ -1714,6 +1889,7 @@ DATA_PORT=${DATA_PORT:-}
 DATA_PORT1=${DATA_PORT1:-}
 DATA_PORT2=${DATA_PORT2:-}
 DATA_PORTS=${DATA_PORTS:-}
+DATA_PORT_FAMILIES=${DATA_PORT_FAMILIES:-}
 DATA_IPS=${DATA_IPS:-}
 BROADCAST_DOMAIN_NAME=${BROADCAST_DOMAIN_NAME:-}
 IPSPACE_NAME=${IPSPACE_NAME:-}
@@ -1725,7 +1901,9 @@ LIFS_PER_NODE=${LIFS_PER_NODE:-${MULTIPLIER:-1}}
 USE_SUBNET_DYNAMIC=${USE_SUBNET_DYNAMIC:-false}
 USE_SAME_DATA_PORT=${USE_SAME_DATA_PORT:-false}
 BALANCE_ACROSS_PORTS=${BALANCE_ACROSS_PORTS:-false}
+USE_PORT_FAMILY_BALANCING=${USE_PORT_FAMILY_BALANCING:-false}
 DEFAULT_GATEWAY=${DEFAULT_GATEWAY:-${DATA_GATEWAY:-}}
+ETHERNET_PORTS_JSON=${ETHERNET_PORTS_JSON:-}
 
 if [ -z "$DATA_IPS" ]; then
   legacy_ips=()
@@ -1764,21 +1942,7 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="default_gateway"
-      fi
-      ;;
-    default_gateway)
-      if ensure_default_gateway_for_svm; then
-        rc=0
-      else
-        rc=$?
-      fi
-      if [ "$rc" -eq 0 ]; then
         wizard_step="lif_prefix"
-      elif [ "$rc" -eq 2 ]; then
-        wizard_step="svm"
-      else
-        exit "$rc"
       fi
       ;;
     lif_prefix)
@@ -1790,7 +1954,7 @@ while true; do
       if [ "$rc" -eq 0 ]; then
         wizard_step="nodes"
       elif [ "$rc" -eq 2 ]; then
-        wizard_step="default_gateway"
+        wizard_step="svm"
       else
         exit "$rc"
       fi
@@ -1862,7 +2026,7 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="confirm"
+        wizard_step="default_gateway"
       elif [ "$rc" -eq 2 ]; then
         wizard_step="dynamic_subnet"
       else
@@ -1876,9 +2040,27 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="confirm"
+        wizard_step="default_gateway"
       elif [ "$rc" -eq 2 ]; then
         wizard_step="dynamic_subnet"
+      else
+        exit "$rc"
+      fi
+      ;;
+    default_gateway)
+      if ensure_default_gateway_for_svm; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="confirm"
+      elif [ "$rc" -eq 2 ]; then
+        if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+          wizard_step="subnet"
+        else
+          wizard_step="static_networking"
+        fi
       else
         exit "$rc"
       fi
@@ -1894,11 +2076,7 @@ while true; do
       if [ "$rc" -eq 0 ]; then
         break
       elif [ "$rc" -eq 2 ]; then
-        if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
-          wizard_step="subnet"
-        else
-          wizard_step="static_networking"
-        fi
+        wizard_step="default_gateway"
       elif [ "$rc" -eq 3 ]; then
         exit 0
       else
