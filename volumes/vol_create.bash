@@ -3,6 +3,8 @@
 set -euo pipefail
 
 TB_BYTES=1099511627776
+DEBUG=${DEBUG:-false}
+DEBUG_LOG_FILE=${DEBUG_LOG_FILE:-}
 
 require_command() {
   local cmd=$1
@@ -22,6 +24,77 @@ is_non_negative_integer() {
 
 normalize_input() {
   printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+debug_log() {
+  if [ "$DEBUG" != "true" ]; then
+    return
+  fi
+  printf '[debug] %s\n' "$*" >> "$DEBUG_LOG_FILE"
+}
+
+debug_print_json() {
+  local label=$1
+  local content=${2:-}
+
+  if [ "$DEBUG" != "true" ]; then
+    return
+  fi
+
+  if [ -z "$content" ]; then
+    printf '[debug] %s: <empty>\n' "$label" >> "$DEBUG_LOG_FILE"
+    return
+  fi
+
+  if printf '%s' "$content" | jq -e . >/dev/null 2>&1; then
+    printf '[debug] %s:\n' "$label" >> "$DEBUG_LOG_FILE"
+    printf '%s' "$content" | jq . >> "$DEBUG_LOG_FILE"
+  else
+    printf '[debug] %s: %s\n' "$label" "$content" >> "$DEBUG_LOG_FILE"
+  fi
+}
+
+print_usage() {
+  cat <<'EOF'
+Usage: vol_create.bash [--debug]
+
+Options:
+  --debug   Enable verbose REST request/response tracing to a log file.
+            Optional: set DEBUG_LOG_FILE=/path/to/file.log
+EOF
+}
+
+init_debug_logging() {
+  if [ "$DEBUG" != "true" ]; then
+    return
+  fi
+
+  if [ -z "$DEBUG_LOG_FILE" ]; then
+    DEBUG_LOG_FILE="vol_create_debug_$(date +%Y%m%d_%H%M%S).log"
+  fi
+
+  : > "$DEBUG_LOG_FILE"
+  echo "Debug logging enabled. Writing REST trace to: $DEBUG_LOG_FILE"
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --debug)
+        DEBUG=true
+        ;;
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        print_usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
 }
 
 display_volume_type() {
@@ -242,8 +315,15 @@ api_request() {
   local url=$2
   local payload=${3:-}
   local response
+  local response_no_time
   local http_code
+  local time_total
   local body
+
+  debug_log "Request: $method $url"
+  if [ -n "$payload" ]; then
+    debug_print_json "Request payload" "$payload"
+  fi
 
   if [ -n "$payload" ]; then
     response=$(curl -sS -k -X "$method" "$url" \
@@ -251,16 +331,21 @@ api_request() {
       -H "authorization: Basic $AUTH_TOK" \
       -H "Content-Type: application/json" \
       -d "$payload" \
-      -w '\n%{http_code}')
+      -w '\n%{http_code}\n%{time_total}')
   else
     response=$(curl -sS -k -X "$method" "$url" \
       -H "accept: application/json" \
       -H "authorization: Basic $AUTH_TOK" \
-      -w '\n%{http_code}')
+      -w '\n%{http_code}\n%{time_total}')
   fi
 
-  http_code=${response##*$'\n'}
-  body=${response%$'\n'*}
+  time_total=${response##*$'\n'}
+  response_no_time=${response%$'\n'*}
+  http_code=${response_no_time##*$'\n'}
+  body=${response_no_time%$'\n'*}
+
+  debug_log "Response: HTTP $http_code (${time_total}s) for $method $url"
+  debug_print_json "Response body" "$body"
 
   if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
     echo "API request failed ($method $url): HTTP $http_code" >&2
@@ -360,6 +445,9 @@ wait_for_volume_ready() {
   echo "Timed out waiting for volume '$volume_name' to report expected size." >&2
   exit 1
 }
+
+parse_args "$@"
+init_debug_logging
 
 require_command curl
 require_command jq
