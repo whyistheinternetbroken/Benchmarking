@@ -258,6 +258,28 @@ validate_data_ips() {
   fi
 }
 
+validate_data_ports() {
+  local raw_value=$1
+  local normalized
+  local entry
+
+  DATA_PORT_LIST=()
+  IFS=',' read -r -a raw_ports <<< "$raw_value"
+
+  for entry in "${raw_ports[@]}"; do
+    normalized=$(normalize_input "$entry")
+    if [ -z "$normalized" ]; then
+      continue
+    fi
+    DATA_PORT_LIST+=("$normalized")
+  done
+
+  if [ "${#DATA_PORT_LIST[@]}" -eq 0 ]; then
+    echo "At least one data port is required." >&2
+    return 1
+  fi
+}
+
 get_nodes_json() {
   api_request "GET" "https://$MGMT_IP/api/cluster/nodes?fields=name&return_records=true&return_timeout=15&max_records=10000"
 }
@@ -350,6 +372,10 @@ get_subnets_json() {
   api_request "GET" "https://$MGMT_IP/api/network/ip/subnets?fields=name&return_records=true&return_timeout=15&max_records=10000"
 }
 
+get_broadcast_domains_json() {
+  api_request "GET" "https://$MGMT_IP/api/network/ethernet/broadcast-domains?fields=name,uuid,ipspace.name&return_records=true&return_timeout=15&max_records=10000"
+}
+
 show_subnets() {
   local subnets_json=$1
   local subnet_names
@@ -368,12 +394,244 @@ show_subnets() {
   echo
 }
 
+show_broadcast_domains() {
+  local broadcast_domains_json=$1
+  local rows
+
+  rows=$(printf '%s' "$broadcast_domains_json" | jq -r '
+    .records[]
+    | [.name, (.ipspace.name // "-"), (.uuid // "-")]
+    | @tsv
+  ' | sort)
+
+  if [ -z "$rows" ]; then
+    echo "No broadcast domains returned by the API."
+    return
+  fi
+
+  echo
+  echo "Available broadcast domains:"
+  while IFS=$'\t' read -r bd_name ipspace_name bd_uuid; do
+    echo "  - $bd_name (IPspace: $ipspace_name, UUID: $bd_uuid)"
+  done <<< "$rows"
+  echo
+}
+
 subnet_exists() {
   local subnet_name=$1
   local subnets_json=$2
   local count
   count=$(printf '%s' "$subnets_json" | jq -r --arg subnet "$subnet_name" '[.records[] | select(.name == $subnet)] | length')
   [ "$count" -gt 0 ]
+}
+
+resolve_broadcast_domain_uuid() {
+  local broadcast_domain_selector=$1
+  local broadcast_domains_json=$2
+  local matches
+
+  matches=$(printf '%s' "$broadcast_domains_json" | jq -r --arg selector "$broadcast_domain_selector" '
+    [
+      .records[]
+      | select(.uuid == $selector or .name == $selector)
+      | .uuid
+    ]
+  ')
+
+  if [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ]; then
+    printf '%s' "$matches" | jq -r '.[0]'
+    return 0
+  fi
+
+  if [ "$(printf '%s' "$matches" | jq 'length')" -gt 1 ]; then
+    echo "Multiple broadcast domains matched '$broadcast_domain_selector'. Please use the UUID shown in the list." >&2
+    return 1
+  fi
+
+  echo "Broadcast domain '$broadcast_domain_selector' was not found." >&2
+  return 1
+}
+
+prompt_broadcast_domain_uuid() {
+  local current_value=${BROADCAST_DOMAIN_UUID:-}
+  local input_value
+  local broadcast_domains_json
+  local resolved_uuid
+
+  while true; do
+    echo "Provide ? to list broadcast domains"
+    if [ -n "$current_value" ]; then
+      read -r -p "Enter broadcast domain name or UUID [$current_value]: " input_value
+    else
+      read -r -p "Enter broadcast domain name or UUID: " input_value
+    fi
+
+    input_value=$(normalize_input "$input_value")
+    if [ "$input_value" = "?" ]; then
+      broadcast_domains_json=$(get_broadcast_domains_json)
+      show_broadcast_domains "$broadcast_domains_json"
+      continue
+    fi
+
+    if [ -z "$input_value" ] && [ -n "$current_value" ]; then
+      input_value=$current_value
+    fi
+
+    if [ -z "$input_value" ]; then
+      echo "BROADCAST_DOMAIN_UUID is required." >&2
+      continue
+    fi
+
+    broadcast_domains_json=$(get_broadcast_domains_json)
+    if resolved_uuid=$(resolve_broadcast_domain_uuid "$input_value" "$broadcast_domains_json"); then
+      BROADCAST_DOMAIN_UUID=$resolved_uuid
+      return
+    fi
+  done
+}
+
+create_subnet() {
+  local payload
+
+  payload=$(jq -n \
+    --arg subnet_name "$SUBNET_NAME" \
+    --arg broadcast_domain_uuid "$BROADCAST_DOMAIN_UUID" \
+    --arg subnet_address "$SUBNET_ADDRESS" \
+    --arg subnet_netmask "$SUBNET_NETMASK" \
+    --arg range_start "$SUBNET_RANGE_START" \
+    --arg range_end "$SUBNET_RANGE_END" \
+    --arg gateway "${SUBNET_GATEWAY:-}" \
+    '{
+      name: $subnet_name,
+      broadcast_domain: { uuid: $broadcast_domain_uuid },
+      subnet: {
+        address: $subnet_address,
+        netmask: $subnet_netmask
+      },
+      ip_ranges: [
+        {
+          start: $range_start,
+          end: $range_end
+        }
+      ]
+    }
+    + (if $gateway != "" then { gateway: $gateway } else {} end)')
+
+  echo "Creating subnet '$SUBNET_NAME'"
+  api_request "POST" "https://$MGMT_IP/api/network/ip/subnets?return_timeout=0&return_records=false" "$payload" >/dev/null
+}
+
+prompt_and_create_subnet() {
+  while true; do
+    if [ -n "${SUBNET_NAME:-}" ]; then
+      read -r -p "Enter new subnet name [$SUBNET_NAME]: " subnet_name_input
+    else
+      read -r -p "Enter new subnet name: " subnet_name_input
+    fi
+    subnet_name_input=$(normalize_input "$subnet_name_input")
+    if [ -z "$subnet_name_input" ] && [ -n "${SUBNET_NAME:-}" ]; then
+      subnet_name_input=$SUBNET_NAME
+    fi
+    if [ -z "$subnet_name_input" ]; then
+      echo "Subnet name is required." >&2
+      continue
+    fi
+    SUBNET_NAME=$subnet_name_input
+    break
+  done
+
+  prompt_broadcast_domain_uuid
+
+  while true; do
+    if [ -n "${SUBNET_ADDRESS:-}" ]; then
+      read -r -p "Enter subnet network address [$SUBNET_ADDRESS]: " subnet_address_input
+    else
+      read -r -p "Enter subnet network address: " subnet_address_input
+    fi
+    subnet_address_input=$(normalize_input "$subnet_address_input")
+    if [ -z "$subnet_address_input" ] && [ -n "${SUBNET_ADDRESS:-}" ]; then
+      subnet_address_input=$SUBNET_ADDRESS
+    fi
+    if ! is_valid_ipv4 "$subnet_address_input"; then
+      echo "Subnet network address must be a valid IPv4 address." >&2
+      continue
+    fi
+    SUBNET_ADDRESS=$subnet_address_input
+    break
+  done
+
+  while true; do
+    if [ -n "${SUBNET_NETMASK:-}" ]; then
+      read -r -p "Enter subnet netmask or prefix length [$SUBNET_NETMASK]: " subnet_netmask_input
+    else
+      read -r -p "Enter subnet netmask or prefix length: " subnet_netmask_input
+    fi
+    subnet_netmask_input=$(normalize_input "$subnet_netmask_input")
+    if [ -z "$subnet_netmask_input" ] && [ -n "${SUBNET_NETMASK:-}" ]; then
+      subnet_netmask_input=$SUBNET_NETMASK
+    fi
+    if [[ "$subnet_netmask_input" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || is_valid_ipv4 "$subnet_netmask_input"; then
+      SUBNET_NETMASK=$subnet_netmask_input
+      break
+    fi
+    echo "Subnet netmask must be a prefix length (1-32) or dotted IPv4 mask." >&2
+  done
+
+  while true; do
+    if [ -n "${SUBNET_GATEWAY:-}" ]; then
+      read -r -p "Enter subnet gateway IP (optional) [$SUBNET_GATEWAY]: " subnet_gateway_input
+    else
+      read -r -p "Enter subnet gateway IP (optional): " subnet_gateway_input
+    fi
+    subnet_gateway_input=$(normalize_input "$subnet_gateway_input")
+    if [ -z "$subnet_gateway_input" ] && [ -n "${SUBNET_GATEWAY:-}" ]; then
+      subnet_gateway_input=$SUBNET_GATEWAY
+    fi
+    if [ -n "$subnet_gateway_input" ] && ! is_valid_ipv4 "$subnet_gateway_input"; then
+      echo "Subnet gateway must be a valid IPv4 address." >&2
+      continue
+    fi
+    SUBNET_GATEWAY=$subnet_gateway_input
+    break
+  done
+
+  while true; do
+    if [ -n "${SUBNET_RANGE_START:-}" ]; then
+      read -r -p "Enter subnet IP range start [$SUBNET_RANGE_START]: " subnet_range_start_input
+    else
+      read -r -p "Enter subnet IP range start: " subnet_range_start_input
+    fi
+    subnet_range_start_input=$(normalize_input "$subnet_range_start_input")
+    if [ -z "$subnet_range_start_input" ] && [ -n "${SUBNET_RANGE_START:-}" ]; then
+      subnet_range_start_input=$SUBNET_RANGE_START
+    fi
+    if ! is_valid_ipv4 "$subnet_range_start_input"; then
+      echo "Subnet IP range start must be a valid IPv4 address." >&2
+      continue
+    fi
+    SUBNET_RANGE_START=$subnet_range_start_input
+    break
+  done
+
+  while true; do
+    if [ -n "${SUBNET_RANGE_END:-}" ]; then
+      read -r -p "Enter subnet IP range end [$SUBNET_RANGE_END]: " subnet_range_end_input
+    else
+      read -r -p "Enter subnet IP range end: " subnet_range_end_input
+    fi
+    subnet_range_end_input=$(normalize_input "$subnet_range_end_input")
+    if [ -z "$subnet_range_end_input" ] && [ -n "${SUBNET_RANGE_END:-}" ]; then
+      subnet_range_end_input=$SUBNET_RANGE_END
+    fi
+    if ! is_valid_ipv4 "$subnet_range_end_input"; then
+      echo "Subnet IP range end must be a valid IPv4 address." >&2
+      continue
+    fi
+    SUBNET_RANGE_END=$subnet_range_end_input
+    break
+  done
+
+  create_subnet
 }
 
 prompt_subnet_name() {
@@ -383,6 +641,7 @@ prompt_subnet_name() {
 
   while true; do
     echo "Provide ? to list subnet names"
+    echo "Type create to create a subnet."
     if [ -n "$current_value" ]; then
       read -r -p "Enter subnet name [$current_value]: " input_value
     else
@@ -394,6 +653,11 @@ prompt_subnet_name() {
       subnets_json=$(get_subnets_json)
       show_subnets "$subnets_json"
       continue
+    fi
+
+    if [ "${input_value,,}" = "create" ]; then
+      prompt_and_create_subnet
+      return
     fi
 
     if [ -z "$input_value" ] && [ -n "$current_value" ]; then
@@ -563,6 +827,113 @@ api_request() {
   printf '%s' "$body"
 }
 
+get_svm_interfaces_json() {
+  local encoded_svm
+  encoded_svm=$(uri_encode "$SVM")
+  api_request "GET" "https://$MGMT_IP/api/network/ip/interfaces?svm.name=$encoded_svm&fields=name,ip.address&return_records=true&return_timeout=15&max_records=10000"
+}
+
+lookup_interface_ip() {
+  local interfaces_json=$1
+  local lif_name=$2
+
+  printf '%s' "$interfaces_json" | jq -r --arg lif_name "$lif_name" '
+    [.records[] | select(.name == $lif_name) | .ip.address // empty][0] // empty
+  '
+}
+
+wait_for_interface_ip() {
+  local lif_name=$1
+  local fallback_ip=${2:-}
+  local max_attempts=30
+  local attempt=1
+  local interfaces_json
+  local interface_ip
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    interfaces_json=$(get_svm_interfaces_json)
+    interface_ip=$(lookup_interface_ip "$interfaces_json" "$lif_name")
+    if [ -n "$interface_ip" ]; then
+      printf '%s' "$interface_ip"
+      return 0
+    fi
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+
+  if [ -n "$fallback_ip" ] && [ "$fallback_ip" != "-" ]; then
+    printf '%s' "$fallback_ip"
+    return 0
+  fi
+
+  return 1
+}
+
+ping_host() {
+  local ip_address=$1
+  local uname_value
+
+  uname_value=$(uname -s 2>/dev/null || printf '%s' "unknown")
+  case "$uname_value" in
+    MINGW*|MSYS*|CYGWIN*)
+      ping -n 2 -w 2000 "$ip_address" >/dev/null
+      ;;
+    *)
+      ping -c 2 -W 2 "$ip_address" >/dev/null
+      ;;
+  esac
+}
+
+run_optional_ping_test() {
+  local ping_choice
+  local idx
+  local lif_name
+  local fallback_ip
+  local resolved_ip
+  local passed_count=0
+  local failed_count=0
+
+  while true; do
+    read -r -p "Run ping test for created interfaces? [y/N]: " ping_choice
+    ping_choice=$(normalize_input "$ping_choice")
+    ping_choice=${ping_choice,,}
+    case "$ping_choice" in
+      y|yes)
+        require_command ping
+        echo
+        echo "Running ping tests..."
+        for idx in "${!PLANNED_NAMES[@]}"; do
+          lif_name=${PLANNED_NAMES[$idx]}
+          fallback_ip=${PLANNED_IPS[$idx]}
+
+          if resolved_ip=$(wait_for_interface_ip "$lif_name" "$fallback_ip"); then
+            printf 'Pinging %s (%s)... ' "$lif_name" "$resolved_ip"
+            if ping_host "$resolved_ip"; then
+              echo "PASS"
+              passed_count=$((passed_count + 1))
+            else
+              echo "FAIL"
+              failed_count=$((failed_count + 1))
+            fi
+          else
+            echo "Pinging $lif_name... SKIPPED (no IP assigned yet)"
+            failed_count=$((failed_count + 1))
+          fi
+        done
+        echo
+        echo "Ping test summary: $passed_count passed, $failed_count failed."
+        return
+        ;;
+      ""|n|no)
+        return
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+}
+
 extract_last_octet() {
   local ip_address=$1
   printf '%s' "${ip_address##*.}"
@@ -585,6 +956,32 @@ build_lif_name_dynamic() {
   local safe_node
   safe_node=$(sanitize_node_name "$node_name")
   printf '%s_%s_%s' "$LIF_PREFIX" "$safe_node" "$per_node_ordinal"
+}
+
+select_port_for_plan() {
+  local node_index=$1
+  local per_node_index=$2
+  local port_count=${#DATA_PORT_LIST[@]}
+  local selected_index
+
+  if [ "$port_count" -le 0 ]; then
+    echo "No data ports are available for planning." >&2
+    exit 1
+  fi
+
+  if [ "$USE_SAME_DATA_PORT" = "true" ]; then
+    printf '%s' "${DATA_PORT_LIST[0]}"
+    return
+  fi
+
+  if [ "$BALANCE_ACROSS_PORTS" = "true" ]; then
+    selected_index=$(( (per_node_index - 1) % port_count ))
+    printf '%s' "${DATA_PORT_LIST[$selected_index]}"
+    return
+  fi
+
+  selected_index=$(( node_index % port_count ))
+  printf '%s' "${DATA_PORT_LIST[$selected_index]}"
 }
 
 build_payload_static() {
@@ -677,12 +1074,16 @@ LIF_PREFIX=${LIF_PREFIX:-data}
 DATA_MASK=${DATA_MASK:-255.255.248.0}
 NODE1=${NODE1:-}
 NODE2=${NODE2:-}
+DATA_PORT=${DATA_PORT:-}
 DATA_PORT1=${DATA_PORT1:-}
 DATA_PORT2=${DATA_PORT2:-}
+DATA_PORTS=${DATA_PORTS:-}
 DATA_IPS=${DATA_IPS:-}
 SUBNET_NAME=${SUBNET_NAME:-}
 LIFS_PER_NODE=${LIFS_PER_NODE:-${MULTIPLIER:-1}}
 USE_SUBNET_DYNAMIC=${USE_SUBNET_DYNAMIC:-false}
+USE_SAME_DATA_PORT=${USE_SAME_DATA_PORT:-false}
+BALANCE_ACROSS_PORTS=${BALANCE_ACROSS_PORTS:-false}
 DEFAULT_GATEWAY=${DEFAULT_GATEWAY:-${DATA_GATEWAY:-}}
 
 if [ -z "$DATA_IPS" ]; then
@@ -695,6 +1096,18 @@ if [ -z "$DATA_IPS" ]; then
   done
   if [ "${#legacy_ips[@]}" -gt 0 ]; then
     DATA_IPS=$(IFS=, ; echo "${legacy_ips[*]}")
+  fi
+fi
+
+if [ -z "$DATA_PORTS" ]; then
+  if [ -n "$DATA_PORT" ]; then
+    DATA_PORTS=$DATA_PORT
+  elif [ -n "$DATA_PORT1" ] && [ -n "$DATA_PORT2" ]; then
+    DATA_PORTS="$DATA_PORT1,$DATA_PORT2"
+  elif [ -n "$DATA_PORT1" ]; then
+    DATA_PORTS=$DATA_PORT1
+  elif [ -n "$DATA_PORT2" ]; then
+    DATA_PORTS=$DATA_PORT2
   fi
 fi
 
@@ -739,9 +1152,6 @@ else
   TARGET_NODES=("$NODE1" "$NODE2")
 fi
 
-prompt_if_empty DATA_PORT1 "Enter data port 1 name: "
-prompt_if_empty DATA_PORT2 "Enter data port 2 name: "
-
 while true; do
   if [ -n "$LIFS_PER_NODE" ]; then
     read -r -p "Enter multiplier (number of LIFs per node) [$LIFS_PER_NODE]: " multiplier_input
@@ -758,6 +1168,83 @@ while true; do
   fi
   LIFS_PER_NODE=$multiplier_input
   break
+done
+
+while true; do
+  read -r -p "Use the same data port on all nodes? [y/N]: " same_port_choice
+  same_port_choice=$(normalize_input "$same_port_choice")
+  same_port_choice=${same_port_choice,,}
+  case "$same_port_choice" in
+    y|yes)
+      USE_SAME_DATA_PORT=true
+      BALANCE_ACROSS_PORTS=false
+      while true; do
+        default_port_value=""
+        if validate_data_ports "$DATA_PORTS" >/dev/null 2>&1; then
+          default_port_value=${DATA_PORT_LIST[0]}
+        fi
+        if [ -n "$default_port_value" ]; then
+          read -r -p "Enter data port name [$default_port_value]: " data_port_input
+        else
+          read -r -p "Enter data port name: " data_port_input
+        fi
+        data_port_input=$(normalize_input "$data_port_input")
+        if [ -z "$data_port_input" ] && [ -n "$default_port_value" ]; then
+          data_port_input=$default_port_value
+        fi
+        if validate_data_ports "$data_port_input"; then
+          DATA_PORTS=$data_port_input
+          break
+        fi
+      done
+      break
+      ;;
+    ""|n|no)
+      USE_SAME_DATA_PORT=false
+      if [ "$LIFS_PER_NODE" -gt 1 ]; then
+        while true; do
+          read -r -p "Balance interfaces across ports on each node? [y/N]: " balance_ports_choice
+          balance_ports_choice=$(normalize_input "$balance_ports_choice")
+          balance_ports_choice=${balance_ports_choice,,}
+          case "$balance_ports_choice" in
+            y|yes)
+              BALANCE_ACROSS_PORTS=true
+              break
+              ;;
+            ""|n|no)
+              BALANCE_ACROSS_PORTS=false
+              break
+              ;;
+            *)
+              echo "Please enter y or n." >&2
+              ;;
+          esac
+        done
+      else
+        BALANCE_ACROSS_PORTS=false
+      fi
+
+      while true; do
+        if [ -n "$DATA_PORTS" ]; then
+          read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
+        else
+          read -r -p "Enter data ports to use (comma-separated): " data_ports_input
+        fi
+        data_ports_input=$(normalize_input "$data_ports_input")
+        if [ -z "$data_ports_input" ] && [ -n "$DATA_PORTS" ]; then
+          data_ports_input=$DATA_PORTS
+        fi
+        if validate_data_ports "$data_ports_input"; then
+          DATA_PORTS=$data_ports_input
+          break
+        fi
+      done
+      break
+      ;;
+    *)
+      echo "Please enter y or n." >&2
+      ;;
+  esac
 done
 
 while true; do
@@ -833,14 +1320,11 @@ PLANNED_PORTS=()
 PLANNED_IPS=()
 
 plan_index=0
-for node_name in "${TARGET_NODES[@]}"; do
+for node_index in "${!TARGET_NODES[@]}"; do
+  node_name=${TARGET_NODES[$node_index]}
   per_node_index=1
   while [ "$per_node_index" -le "$LIFS_PER_NODE" ]; do
-    if [ $(((per_node_index - 1) % 2)) -eq 0 ]; then
-      selected_port=$DATA_PORT1
-    else
-      selected_port=$DATA_PORT2
-    fi
+    selected_port=$(select_port_for_plan "$node_index" "$per_node_index")
 
     if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
       lif_name=$(build_lif_name_dynamic "$node_name" "$per_node_index")
@@ -899,3 +1383,4 @@ done
 
 echo
 echo "Create requests submitted for ${#PLANNED_NAMES[@]} interface(s) in SVM '$SVM'."
+run_optional_ping_test
