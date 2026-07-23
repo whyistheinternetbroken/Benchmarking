@@ -5,6 +5,7 @@ set -euo pipefail
 TB_BYTES=1099511627776
 DEBUG=${DEBUG:-false}
 DEBUG_LOG_FILE=${DEBUG_LOG_FILE:-}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 require_command() {
   local cmd=$1
@@ -60,6 +61,7 @@ Usage: vol_create.bash [--debug]
 
 Options:
   --debug   Enable verbose REST request/response tracing to a log file.
+            Default path: <volumes>/logs/vol_create_debug_YYYYmmdd_HHMMSS.log
             Optional: set DEBUG_LOG_FILE=/path/to/file.log
 EOF
 }
@@ -70,9 +72,10 @@ init_debug_logging() {
   fi
 
   if [ -z "$DEBUG_LOG_FILE" ]; then
-    DEBUG_LOG_FILE="vol_create_debug_$(date +%Y%m%d_%H%M%S).log"
+    DEBUG_LOG_FILE="$SCRIPT_DIR/logs/vol_create_debug_$(date +%Y%m%d_%H%M%S).log"
   fi
 
+  mkdir -p "$(dirname "$DEBUG_LOG_FILE")"
   : > "$DEBUG_LOG_FILE"
   echo "Debug logging enabled. Writing REST trace to: $DEBUG_LOG_FILE"
 }
