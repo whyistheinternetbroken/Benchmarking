@@ -10,8 +10,66 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 require_command() {
   local cmd=$1
   if ! command -v "$cmd" >/dev/null 2>&1; then
+    local install_choice
+    local install_status=1
+    local package_manager=""
+
     echo "Required command not found: $cmd" >&2
-    exit 1
+    if [ ! -t 0 ]; then
+      echo "Cannot prompt to install '$cmd' in a non-interactive shell. Exiting." >&2
+      exit 1
+    fi
+
+    read -r -p "Would you like this script to try installing '$cmd' now? [y/N]: " install_choice
+    install_choice=$(normalize_input "$install_choice")
+    install_choice=${install_choice,,}
+    if [ "$install_choice" != "y" ] && [ "$install_choice" != "yes" ]; then
+      echo "Missing requirement '$cmd'. Exiting." >&2
+      exit 1
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+      package_manager="apt-get"
+    elif command -v dnf >/dev/null 2>&1; then
+      package_manager="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+      package_manager="yum"
+    elif command -v zypper >/dev/null 2>&1; then
+      package_manager="zypper"
+    elif command -v brew >/dev/null 2>&1; then
+      package_manager="brew"
+    elif command -v pacman >/dev/null 2>&1; then
+      package_manager="pacman"
+    fi
+
+    case "$package_manager" in
+      apt-get)
+        sudo apt-get update && sudo apt-get install -y "$cmd" && install_status=0
+        ;;
+      dnf)
+        sudo dnf install -y "$cmd" && install_status=0
+        ;;
+      yum)
+        sudo yum install -y "$cmd" && install_status=0
+        ;;
+      zypper)
+        sudo zypper install -y "$cmd" && install_status=0
+        ;;
+      brew)
+        brew install "$cmd" && install_status=0
+        ;;
+      pacman)
+        sudo pacman -Sy --noconfirm "$cmd" && install_status=0
+        ;;
+      *)
+        echo "No supported package manager detected for automatic installation." >&2
+        ;;
+    esac
+
+    if [ "$install_status" -ne 0 ] || ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Failed to install required command '$cmd'. Please install it manually and re-run." >&2
+      exit 1
+    fi
   fi
 }
 

@@ -49,4 +49,4 @@ bash create_interfaces.bash --debug
 bash cleanup_interfaces.bash --debug
 ```
 
-Debug logs are written to `networking/logs/` by default.
+Debug logs are written to `ONTAP/networking/logs/` by default.

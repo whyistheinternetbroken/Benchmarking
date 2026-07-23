@@ -4,14 +4,16 @@ Benchmarking scripts and utilities for ONTAP REST-based storage and networking w
 
 ## Script overview
 
-### `volumes/`
+All ONTAP-focused scripts are organized under `ONTAP/`.
+
+### `ONTAP/volumes/`
 
 - `vol_create.bash`
   - Interactive volume creation workflow.
 - `vol_delete.bash`
   - Interactive volume cleanup workflow with selective delete options.
 
-### `networking/`
+### `ONTAP/networking/`
 
 - `create_interfaces.bash`
   - Interactive LIF creation workflow.

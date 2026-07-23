@@ -25,7 +25,7 @@ Both scripts support:
 When `--debug` is used, REST tracing is written to log files under:
 
 ```text
-volumes/logs/
+ONTAP/volumes/logs/
 ```
 
 Default log names:
