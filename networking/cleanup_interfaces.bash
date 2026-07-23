@@ -375,6 +375,116 @@ show_interfaces() {
   echo
 }
 
+build_interface_inventory() {
+  local interfaces_json=$1
+  local name
+  local uuid
+
+  ALL_INTERFACE_NAMES=()
+  ALL_INTERFACE_UUIDS=()
+
+  while IFS=$'\t' read -r name uuid; do
+    ALL_INTERFACE_NAMES+=("$name")
+    ALL_INTERFACE_UUIDS+=("$uuid")
+  done < <(printf '%s' "$interfaces_json" | jq -r '.records[] | [.name, .uuid] | @tsv' | sort -V)
+}
+
+show_interfaces_numbered() {
+  local interfaces_json=$1
+  local idx
+  local all_option_number
+
+  build_interface_inventory "$interfaces_json"
+  all_option_number=$(( ${#ALL_INTERFACE_NAMES[@]} + 1 ))
+
+  echo
+  echo "Available LIFs in SVM '$SVM':"
+  for idx in "${!ALL_INTERFACE_NAMES[@]}"; do
+    echo "  $((idx + 1))) ${ALL_INTERFACE_NAMES[$idx]}"
+  done
+  echo "  $all_option_number) ALL LIFs"
+  echo "  0) No LIFs"
+  echo
+}
+
+resolve_interface_selection_by_number() {
+  local selection=$1
+  local all_option_number=$2
+  local normalized
+  local except_index
+  local one_based_index
+  local idx
+  local raw_item
+  local -a selected_indices=()
+
+  TARGET_INTERFACE_NAMES=()
+  TARGET_INTERFACE_UUIDS=()
+
+  normalized=$(normalize_input "$selection")
+  if [ -z "$normalized" ]; then
+    echo "Selection is required." >&2
+    return 1
+  fi
+
+  if [ "$normalized" = "0" ]; then
+    return 0
+  fi
+
+  if [[ "$normalized" == !* ]]; then
+    except_index=${normalized#!}
+    if [[ ! "$except_index" =~ ^[0-9]+$ ]]; then
+      echo "Use !<number> to keep one LIF and delete all others." >&2
+      return 1
+    fi
+    if [ "$except_index" -lt 1 ] || [ "$except_index" -gt "${#ALL_INTERFACE_NAMES[@]}" ]; then
+      echo "Invalid LIF number for !selection: $except_index" >&2
+      return 1
+    fi
+    for idx in "${!ALL_INTERFACE_NAMES[@]}"; do
+      one_based_index=$((idx + 1))
+      if [ "$one_based_index" -ne "$except_index" ]; then
+        TARGET_INTERFACE_NAMES+=("${ALL_INTERFACE_NAMES[$idx]}")
+        TARGET_INTERFACE_UUIDS+=("${ALL_INTERFACE_UUIDS[$idx]}")
+      fi
+    done
+    return 0
+  fi
+
+  if [ "$normalized" = "$all_option_number" ]; then
+    TARGET_INTERFACE_NAMES=("${ALL_INTERFACE_NAMES[@]}")
+    TARGET_INTERFACE_UUIDS=("${ALL_INTERFACE_UUIDS[@]}")
+    return 0
+  fi
+
+  IFS=',' read -r -a raw_items <<< "$normalized"
+  for raw_item in "${raw_items[@]}"; do
+    raw_item=$(normalize_input "$raw_item")
+    if [ -z "$raw_item" ]; then
+      continue
+    fi
+    if [[ ! "$raw_item" =~ ^[0-9]+$ ]]; then
+      echo "LIF selections must be numbers, comma-separated, $all_option_number for all, 0 for none, or !number." >&2
+      return 1
+    fi
+    if [ "$raw_item" -lt 1 ] || [ "$raw_item" -gt "${#ALL_INTERFACE_NAMES[@]}" ]; then
+      echo "Invalid LIF number: $raw_item" >&2
+      return 1
+    fi
+    selected_indices+=("$raw_item")
+  done
+
+  if [ "${#selected_indices[@]}" -eq 0 ]; then
+    echo "No valid LIF numbers were provided." >&2
+    return 1
+  fi
+
+  for one_based_index in "${selected_indices[@]}"; do
+    idx=$((one_based_index - 1))
+    TARGET_INTERFACE_NAMES+=("${ALL_INTERFACE_NAMES[$idx]}")
+    TARGET_INTERFACE_UUIDS+=("${ALL_INTERFACE_UUIDS[$idx]}")
+  done
+}
+
 show_subnets() {
   local subnets_json=$1
   local rows
@@ -543,7 +653,8 @@ prompt_interfaces_cleanup() {
   local interfaces_json
   local cleanup_choice
   local delete_all_choice
-  local selector_input
+  local lif_selection_input
+  local all_option_number
 
   interfaces_json=$(get_svm_interfaces_json)
   if [ "$(printf '%s' "$interfaces_json" | jq -r '.num_records // 0')" -eq 0 ]; then
@@ -558,7 +669,7 @@ prompt_interfaces_cleanup() {
     case "$cleanup_choice" in
       y|yes)
         while true; do
-          read -r -p "Delete all interfaces in SVM '$SVM'? [y/N]: " delete_all_choice
+          read -r -p "Delete all interfaces (data and management) in SVM '$SVM'? [y/N]: " delete_all_choice
           delete_all_choice=$(normalize_input "$delete_all_choice")
           delete_all_choice=${delete_all_choice,,}
           case "$delete_all_choice" in
@@ -568,23 +679,26 @@ prompt_interfaces_cleanup() {
               ;;
             ""|n|no)
               while true; do
-                print_hint "Provide ? to list interfaces"
-                read -r -p "Specify an interface name or wildcard (for example data*) to delete: " selector_input
-                selector_input=$(normalize_input "$selector_input")
-                if [ "$selector_input" = "?" ]; then
-                  show_interfaces "$interfaces_json"
+                show_interfaces_numbered "$interfaces_json"
+                all_option_number=$(( ${#ALL_INTERFACE_NAMES[@]} + 1 ))
+                echo "Delete selected LIFs:"
+                print_hint "Use one number, comma-separated numbers, or $all_option_number for all LIFs"
+                print_hint "Use 0 to delete no LIFs"
+                print_hint "Use !number to delete all except one LIF"
+                read -r -p "Selection: " lif_selection_input
+                lif_selection_input=$(normalize_input "$lif_selection_input")
+                if [ "$lif_selection_input" = "?" ]; then
                   continue
                 fi
-                if [ -z "$selector_input" ]; then
-                  echo "Interface selector is required." >&2
+                if [ -z "$lif_selection_input" ]; then
+                  echo "LIF selection is required." >&2
                   continue
                 fi
-                resolve_target_interfaces "$interfaces_json" "$selector_input"
-                if [ ${#TARGET_INTERFACE_NAMES[@]} -eq 0 ]; then
-                  echo "No interfaces matched '$selector_input' in SVM '$SVM'." >&2
+                if resolve_interface_selection_by_number "$lif_selection_input" "$all_option_number"; then
+                  return
+                else
                   continue
                 fi
-                return
               done
               ;;
             *)
