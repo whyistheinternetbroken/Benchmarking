@@ -214,6 +214,13 @@ prompt_auth_token() {
   done
 }
 
+is_back_command() {
+  local value
+  value=$(normalize_input "$1")
+  value=${value,,}
+  [ "$value" = "b" ] || [ "$value" = "back" ]
+}
+
 get_data_svms_json() {
   api_request "GET" "https://$MGMT_IP/api/svm/svms?fields=name,subtype&return_records=true&return_timeout=15&max_records=10000"
 }
@@ -256,6 +263,7 @@ prompt_svm_name() {
 
   while true; do
     echo "Provide ? to list SVM names"
+    echo "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
       read -r -p "Enter SVM name [$current_value]: " input_value
     else
@@ -267,6 +275,10 @@ prompt_svm_name() {
       svms_json=$(get_data_svms_json)
       show_svms "$svms_json"
       continue
+    fi
+
+    if is_back_command "$input_value"; then
+      return 2
     fi
 
     if [ -z "$input_value" ] && [ -n "$current_value" ]; then
@@ -395,6 +407,7 @@ prompt_node_name() {
 
   while true; do
     echo "Provide ? to list node names"
+    echo "Type B to go back to previous question."
     if [ "$allow_all" = "true" ]; then
       echo "Type all to add LIFs to all nodes."
     fi
@@ -409,6 +422,10 @@ prompt_node_name() {
       nodes_json=$(get_nodes_json)
       show_nodes "$nodes_json"
       continue
+    fi
+
+    if is_back_command "$input_value"; then
+      return 2
     fi
 
     if [ "$allow_all" = "true" ]; then
@@ -451,6 +468,10 @@ get_broadcast_domains_json() {
   api_request "GET" "https://$MGMT_IP/api/network/ethernet/broadcast-domains?fields=name,uuid,ipspace.name&return_records=true&return_timeout=15&max_records=10000"
 }
 
+get_ipspaces_json() {
+  api_request "GET" "https://$MGMT_IP/api/network/ipspaces?fields=name&return_records=true&return_timeout=15&max_records=10000"
+}
+
 show_subnets() {
   local subnets_json=$1
   local subnet_names
@@ -475,7 +496,7 @@ show_broadcast_domains() {
 
   rows=$(printf '%s' "$broadcast_domains_json" | jq -r '
     .records[]
-    | [.name, (.ipspace.name // "-"), (.uuid // "-")]
+    | [.name, (.ipspace.name // "-")]
     | @tsv
   ' | sort)
 
@@ -486,9 +507,27 @@ show_broadcast_domains() {
 
   echo
   echo "Available broadcast domains:"
-  while IFS=$'\t' read -r bd_name ipspace_name bd_uuid; do
-    echo "  - $bd_name (IPspace: $ipspace_name, UUID: $bd_uuid)"
+  while IFS=$'\t' read -r bd_name ipspace_name; do
+    echo "  - $bd_name (IPspace: $ipspace_name)"
   done <<< "$rows"
+  echo
+}
+
+show_ipspaces() {
+  local ipspaces_json=$1
+  local ipspace_names
+
+  ipspace_names=$(printf '%s' "$ipspaces_json" | jq -r '.records[].name // empty' | sort)
+  if [ -z "$ipspace_names" ]; then
+    echo "No IPspaces returned by the API."
+    return
+  fi
+
+  echo
+  echo "Available IPspaces:"
+  while IFS= read -r ipspace_name; do
+    echo "  - $ipspace_name"
+  done <<< "$ipspace_names"
   echo
 }
 
@@ -500,45 +539,105 @@ subnet_exists() {
   [ "$count" -gt 0 ]
 }
 
-resolve_broadcast_domain_uuid() {
-  local broadcast_domain_selector=$1
+broadcast_domain_exists() {
+  local broadcast_domain_name=$1
   local broadcast_domains_json=$2
-  local matches
+  local count
+  count=$(printf '%s' "$broadcast_domains_json" | jq -r --arg name "$broadcast_domain_name" '[.records[] | select(.name == $name)] | length')
+  [ "$count" -gt 0 ]
+}
 
-  matches=$(printf '%s' "$broadcast_domains_json" | jq -r --arg selector "$broadcast_domain_selector" '
-    [
-      .records[]
-      | select(.uuid == $selector or .name == $selector)
-      | .uuid
-    ]
-  ')
+ipspace_exists() {
+  local ipspace_name=$1
+  local ipspaces_json=$2
+  local count
+  count=$(printf '%s' "$ipspaces_json" | jq -r --arg name "$ipspace_name" '[.records[] | select(.name == $name)] | length')
+  [ "$count" -gt 0 ]
+}
 
-  if [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ]; then
-    printf '%s' "$matches" | jq -r '.[0]'
-    return 0
-  fi
+parse_subnet_value() {
+  local subnet_value=$1
+  local subnet_address
+  local subnet_mask
 
-  if [ "$(printf '%s' "$matches" | jq 'length')" -gt 1 ]; then
-    echo "Multiple broadcast domains matched '$broadcast_domain_selector'. Please use the UUID shown in the list." >&2
+  if [[ "$subnet_value" != */* ]]; then
+    echo "Subnet must be in the form x.x.x.x/len or x.x.x.x/netmask." >&2
     return 1
   fi
 
-  echo "Broadcast domain '$broadcast_domain_selector' was not found." >&2
+  subnet_address=${subnet_value%/*}
+  subnet_mask=${subnet_value#*/}
+
+  if ! is_valid_ipv4 "$subnet_address"; then
+    echo "Subnet address must be a valid IPv4 address." >&2
+    return 1
+  fi
+
+  if [[ "$subnet_mask" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || is_valid_ipv4 "$subnet_mask"; then
+    SUBNET_ADDRESS=$subnet_address
+    SUBNET_NETMASK=$subnet_mask
+    SUBNET_CIDR=$subnet_value
+    return 0
+  fi
+
+  echo "Subnet mask must be a prefix length (1-32) or dotted IPv4 mask." >&2
   return 1
 }
 
-prompt_broadcast_domain_uuid() {
-  local current_value=${BROADCAST_DOMAIN_UUID:-}
+parse_ip_ranges_value() {
+  local raw_value=$1
+  local normalized_value
+  local range_item
+  local range_start
+  local range_end
+  local -a raw_ranges=()
+  local ranges_json='[]'
+
+  normalized_value=$(normalize_input "$raw_value")
+  if [ -z "$normalized_value" ]; then
+    SUBNET_IP_RANGES_INPUT=
+    SUBNET_IP_RANGES_JSON='[]'
+    return 0
+  fi
+
+  IFS=',' read -r -a raw_ranges <<< "$normalized_value"
+  for range_item in "${raw_ranges[@]}"; do
+    range_item=$(normalize_input "$range_item")
+    if [ -z "$range_item" ]; then
+      continue
+    fi
+    if [[ "$range_item" != *-* ]]; then
+      echo "Each IP range must be in the form x.x.x.x-x.x.x.y." >&2
+      return 1
+    fi
+    range_start=${range_item%-*}
+    range_end=${range_item#*-}
+    range_start=$(normalize_input "$range_start")
+    range_end=$(normalize_input "$range_end")
+    if ! is_valid_ipv4 "$range_start" || ! is_valid_ipv4 "$range_end"; then
+      echo "Each IP range start and end must be valid IPv4 addresses." >&2
+      return 1
+    fi
+    ranges_json=$(printf '%s' "$ranges_json" | jq --arg start "$range_start" --arg end "$range_end" '. + [{start: $start, end: $end}]')
+  done
+
+  SUBNET_IP_RANGES_INPUT=$normalized_value
+  SUBNET_IP_RANGES_JSON=$ranges_json
+  return 0
+}
+
+prompt_broadcast_domain_name() {
+  local current_value=${BROADCAST_DOMAIN_NAME:-}
   local input_value
   local broadcast_domains_json
-  local resolved_uuid
 
   while true; do
     echo "Provide ? to list broadcast domains"
+    echo "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
-      read -r -p "Enter broadcast domain name or UUID [$current_value]: " input_value
+      read -r -p "Enter broadcast domain name [$current_value]: " input_value
     else
-      read -r -p "Enter broadcast domain name or UUID: " input_value
+      read -r -p "Enter broadcast domain name: " input_value
     fi
 
     input_value=$(normalize_input "$input_value")
@@ -548,20 +647,69 @@ prompt_broadcast_domain_uuid() {
       continue
     fi
 
+    if is_back_command "$input_value"; then
+      return 2
+    fi
+
     if [ -z "$input_value" ] && [ -n "$current_value" ]; then
       input_value=$current_value
     fi
 
     if [ -z "$input_value" ]; then
-      echo "BROADCAST_DOMAIN_UUID is required." >&2
+      echo "BROADCAST_DOMAIN_NAME is required." >&2
       continue
     fi
 
     broadcast_domains_json=$(get_broadcast_domains_json)
-    if resolved_uuid=$(resolve_broadcast_domain_uuid "$input_value" "$broadcast_domains_json"); then
-      BROADCAST_DOMAIN_UUID=$resolved_uuid
+    if broadcast_domain_exists "$input_value" "$broadcast_domains_json"; then
+      BROADCAST_DOMAIN_NAME=$input_value
       return
     fi
+    echo "Broadcast domain '$input_value' was not found. Type ? to list available broadcast domains." >&2
+  done
+}
+
+prompt_ipspace_name_optional() {
+  local current_value=${IPSPACE_NAME:-}
+  local input_value
+  local ipspaces_json
+
+  while true; do
+    echo "Provide ? to list IPspaces"
+    echo "Type B to go back to previous question."
+    if [ -n "$current_value" ]; then
+      read -r -p "Enter IPspace name (optional) [$current_value]: " input_value
+    else
+      read -r -p "Enter IPspace name (optional): " input_value
+    fi
+
+    input_value=$(normalize_input "$input_value")
+    if [ "$input_value" = "?" ]; then
+      ipspaces_json=$(get_ipspaces_json)
+      show_ipspaces "$ipspaces_json"
+      continue
+    fi
+
+    if is_back_command "$input_value"; then
+      return 2
+    fi
+
+    if [ -z "$input_value" ]; then
+      IPSPACE_NAME=
+      return
+    fi
+
+    if [ -n "$current_value" ] && [ "$input_value" = "$current_value" ]; then
+      IPSPACE_NAME=$input_value
+      return
+    fi
+
+    ipspaces_json=$(get_ipspaces_json)
+    if ipspace_exists "$input_value" "$ipspaces_json"; then
+      IPSPACE_NAME=$input_value
+      return
+    fi
+    echo "IPspace '$input_value' was not found. Type ? to list available IPspaces." >&2
   done
 }
 
@@ -570,26 +718,22 @@ create_subnet() {
 
   payload=$(jq -n \
     --arg subnet_name "$SUBNET_NAME" \
-    --arg broadcast_domain_uuid "$BROADCAST_DOMAIN_UUID" \
+    --arg broadcast_domain_name "$BROADCAST_DOMAIN_NAME" \
+    --arg ipspace_name "${IPSPACE_NAME:-}" \
     --arg subnet_address "$SUBNET_ADDRESS" \
     --arg subnet_netmask "$SUBNET_NETMASK" \
-    --arg range_start "$SUBNET_RANGE_START" \
-    --arg range_end "$SUBNET_RANGE_END" \
+    --argjson ip_ranges "${SUBNET_IP_RANGES_JSON:-[]}" \
     --arg gateway "${SUBNET_GATEWAY:-}" \
     '{
       name: $subnet_name,
-      broadcast_domain: { uuid: $broadcast_domain_uuid },
+      broadcast_domain: { name: $broadcast_domain_name },
       subnet: {
         address: $subnet_address,
         netmask: $subnet_netmask
-      },
-      ip_ranges: [
-        {
-          start: $range_start,
-          end: $range_end
-        }
-      ]
+      }
     }
+    + (if $ip_ranges | length > 0 then { ip_ranges: $ip_ranges } else {} end)
+    + (if $ipspace_name != "" then { ipspace: { name: $ipspace_name } } else {} end)
     + (if $gateway != "" then { gateway: $gateway } else {} end)')
 
   echo "Creating subnet '$SUBNET_NAME'"
@@ -597,116 +741,121 @@ create_subnet() {
 }
 
 prompt_and_create_subnet() {
-  while true; do
-    if [ -n "${SUBNET_NAME:-}" ]; then
-      read -r -p "Enter new subnet name [$SUBNET_NAME]: " subnet_name_input
-    else
-      read -r -p "Enter new subnet name: " subnet_name_input
-    fi
-    subnet_name_input=$(normalize_input "$subnet_name_input")
-    if [ -z "$subnet_name_input" ] && [ -n "${SUBNET_NAME:-}" ]; then
-      subnet_name_input=$SUBNET_NAME
-    fi
-    if [ -z "$subnet_name_input" ]; then
-      echo "Subnet name is required." >&2
-      continue
-    fi
-    SUBNET_NAME=$subnet_name_input
-    break
-  done
-
-  prompt_broadcast_domain_uuid
+  local subnet_step="name"
 
   while true; do
-    if [ -n "${SUBNET_ADDRESS:-}" ]; then
-      read -r -p "Enter subnet network address [$SUBNET_ADDRESS]: " subnet_address_input
-    else
-      read -r -p "Enter subnet network address: " subnet_address_input
-    fi
-    subnet_address_input=$(normalize_input "$subnet_address_input")
-    if [ -z "$subnet_address_input" ] && [ -n "${SUBNET_ADDRESS:-}" ]; then
-      subnet_address_input=$SUBNET_ADDRESS
-    fi
-    if ! is_valid_ipv4 "$subnet_address_input"; then
-      echo "Subnet network address must be a valid IPv4 address." >&2
-      continue
-    fi
-    SUBNET_ADDRESS=$subnet_address_input
-    break
+    case "$subnet_step" in
+      name)
+        echo "Type B to go back to previous question."
+        if [ -n "${SUBNET_NAME:-}" ]; then
+          read -r -p "Enter new subnet name [$SUBNET_NAME]: " subnet_name_input
+        else
+          read -r -p "Enter new subnet name: " subnet_name_input
+        fi
+        subnet_name_input=$(normalize_input "$subnet_name_input")
+        if is_back_command "$subnet_name_input"; then
+          return 2
+        fi
+        if [ -z "$subnet_name_input" ] && [ -n "${SUBNET_NAME:-}" ]; then
+          subnet_name_input=$SUBNET_NAME
+        fi
+        if [ -z "$subnet_name_input" ]; then
+          echo "Subnet name is required." >&2
+          continue
+        fi
+        SUBNET_NAME=$subnet_name_input
+        subnet_step="broadcast_domain"
+        ;;
+      broadcast_domain)
+        if prompt_broadcast_domain_name; then
+          rc=0
+        else
+          rc=$?
+        fi
+        if [ "$rc" -eq 0 ]; then
+          subnet_step="subnet"
+        elif [ "$rc" -eq 2 ]; then
+          subnet_step="name"
+        else
+          return "$rc"
+        fi
+        ;;
+      subnet)
+        echo "Type B to go back to previous question."
+        if [ -n "${SUBNET_CIDR:-}" ]; then
+          read -r -p "Enter subnet (for example 10.10.10.0/24) [$SUBNET_CIDR]: " subnet_value_input
+        else
+          read -r -p "Enter subnet (for example 10.10.10.0/24): " subnet_value_input
+        fi
+        subnet_value_input=$(normalize_input "$subnet_value_input")
+        if is_back_command "$subnet_value_input"; then
+          subnet_step="broadcast_domain"
+          continue
+        fi
+        if [ -z "$subnet_value_input" ] && [ -n "${SUBNET_CIDR:-}" ]; then
+          subnet_value_input=$SUBNET_CIDR
+        fi
+        if [ -z "$subnet_value_input" ]; then
+          echo "Subnet is required." >&2
+          continue
+        fi
+        if parse_subnet_value "$subnet_value_input"; then
+          subnet_step="ip_ranges"
+          continue
+        fi
+        ;;
+      ip_ranges)
+        echo "Type B to go back to previous question."
+        if [ -n "${SUBNET_IP_RANGES_INPUT:-}" ]; then
+          read -r -p "Enter ip-ranges (optional, example x.x.x.x-x.x.x.y) [$SUBNET_IP_RANGES_INPUT]: " subnet_ip_ranges_input
+        else
+          read -r -p "Enter ip-ranges (optional, example x.x.x.x-x.x.x.y): " subnet_ip_ranges_input
+        fi
+        subnet_ip_ranges_input=$(normalize_input "$subnet_ip_ranges_input")
+        if is_back_command "$subnet_ip_ranges_input"; then
+          subnet_step="subnet"
+          continue
+        fi
+        if parse_ip_ranges_value "$subnet_ip_ranges_input"; then
+          subnet_step="ipspace"
+        fi
+        ;;
+      ipspace)
+        if prompt_ipspace_name_optional; then
+          rc=0
+        else
+          rc=$?
+        fi
+        if [ "$rc" -eq 0 ]; then
+          subnet_step="gateway"
+        elif [ "$rc" -eq 2 ]; then
+          subnet_step="ip_ranges"
+        else
+          return "$rc"
+        fi
+        ;;
+      gateway)
+        echo "Type B to go back to previous question."
+        if [ -n "${SUBNET_GATEWAY:-}" ]; then
+          read -r -p "Enter subnet gateway IP (optional) [$SUBNET_GATEWAY]: " subnet_gateway_input
+        else
+          read -r -p "Enter subnet gateway IP (optional): " subnet_gateway_input
+        fi
+        subnet_gateway_input=$(normalize_input "$subnet_gateway_input")
+        if is_back_command "$subnet_gateway_input"; then
+          subnet_step="ipspace"
+          continue
+        fi
+        if [ -n "$subnet_gateway_input" ] && ! is_valid_ipv4 "$subnet_gateway_input"; then
+          echo "Subnet gateway must be a valid IPv4 address." >&2
+          continue
+        fi
+        SUBNET_GATEWAY=$subnet_gateway_input
+        create_subnet
+        return
+        ;;
+    esac
   done
-
-  while true; do
-    if [ -n "${SUBNET_NETMASK:-}" ]; then
-      read -r -p "Enter subnet netmask or prefix length [$SUBNET_NETMASK]: " subnet_netmask_input
-    else
-      read -r -p "Enter subnet netmask or prefix length: " subnet_netmask_input
-    fi
-    subnet_netmask_input=$(normalize_input "$subnet_netmask_input")
-    if [ -z "$subnet_netmask_input" ] && [ -n "${SUBNET_NETMASK:-}" ]; then
-      subnet_netmask_input=$SUBNET_NETMASK
-    fi
-    if [[ "$subnet_netmask_input" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || is_valid_ipv4 "$subnet_netmask_input"; then
-      SUBNET_NETMASK=$subnet_netmask_input
-      break
-    fi
-    echo "Subnet netmask must be a prefix length (1-32) or dotted IPv4 mask." >&2
-  done
-
-  while true; do
-    if [ -n "${SUBNET_GATEWAY:-}" ]; then
-      read -r -p "Enter subnet gateway IP (optional) [$SUBNET_GATEWAY]: " subnet_gateway_input
-    else
-      read -r -p "Enter subnet gateway IP (optional): " subnet_gateway_input
-    fi
-    subnet_gateway_input=$(normalize_input "$subnet_gateway_input")
-    if [ -z "$subnet_gateway_input" ] && [ -n "${SUBNET_GATEWAY:-}" ]; then
-      subnet_gateway_input=$SUBNET_GATEWAY
-    fi
-    if [ -n "$subnet_gateway_input" ] && ! is_valid_ipv4 "$subnet_gateway_input"; then
-      echo "Subnet gateway must be a valid IPv4 address." >&2
-      continue
-    fi
-    SUBNET_GATEWAY=$subnet_gateway_input
-    break
-  done
-
-  while true; do
-    if [ -n "${SUBNET_RANGE_START:-}" ]; then
-      read -r -p "Enter subnet IP range start [$SUBNET_RANGE_START]: " subnet_range_start_input
-    else
-      read -r -p "Enter subnet IP range start: " subnet_range_start_input
-    fi
-    subnet_range_start_input=$(normalize_input "$subnet_range_start_input")
-    if [ -z "$subnet_range_start_input" ] && [ -n "${SUBNET_RANGE_START:-}" ]; then
-      subnet_range_start_input=$SUBNET_RANGE_START
-    fi
-    if ! is_valid_ipv4 "$subnet_range_start_input"; then
-      echo "Subnet IP range start must be a valid IPv4 address." >&2
-      continue
-    fi
-    SUBNET_RANGE_START=$subnet_range_start_input
-    break
-  done
-
-  while true; do
-    if [ -n "${SUBNET_RANGE_END:-}" ]; then
-      read -r -p "Enter subnet IP range end [$SUBNET_RANGE_END]: " subnet_range_end_input
-    else
-      read -r -p "Enter subnet IP range end: " subnet_range_end_input
-    fi
-    subnet_range_end_input=$(normalize_input "$subnet_range_end_input")
-    if [ -z "$subnet_range_end_input" ] && [ -n "${SUBNET_RANGE_END:-}" ]; then
-      subnet_range_end_input=$SUBNET_RANGE_END
-    fi
-    if ! is_valid_ipv4 "$subnet_range_end_input"; then
-      echo "Subnet IP range end must be a valid IPv4 address." >&2
-      continue
-    fi
-    SUBNET_RANGE_END=$subnet_range_end_input
-    break
-  done
-
-  create_subnet
 }
 
 prompt_subnet_name() {
@@ -717,6 +866,7 @@ prompt_subnet_name() {
   while true; do
     echo "Provide ? to list subnet names"
     echo "Type create to create a subnet."
+    echo "Type B to go back to previous question."
     if [ -n "$current_value" ]; then
       read -r -p "Enter subnet name [$current_value]: " input_value
     else
@@ -730,9 +880,23 @@ prompt_subnet_name() {
       continue
     fi
 
+    if is_back_command "$input_value"; then
+      return 2
+    fi
+
     if [ "${input_value,,}" = "create" ]; then
-      prompt_and_create_subnet
-      return
+      if prompt_and_create_subnet; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        return
+      fi
+      if [ "$rc" -eq 2 ]; then
+        return 2
+      fi
+      return "$rc"
     fi
 
     if [ -z "$input_value" ] && [ -n "$current_value" ]; then
@@ -819,18 +983,26 @@ ensure_default_gateway_for_svm() {
 
   echo "No default gateway route found for SVM '$SVM'."
   while true; do
+    echo "Type B to go back to previous question."
     read -r -p "Would you like to add a default gateway route now? [y/N]: " add_gateway_choice
     add_gateway_choice=$(normalize_input "$add_gateway_choice")
+    if is_back_command "$add_gateway_choice"; then
+      return 2
+    fi
     add_gateway_choice=${add_gateway_choice,,}
     case "$add_gateway_choice" in
       y|yes)
         while true; do
+          echo "Type B to go back to previous question."
           if [ -n "${DEFAULT_GATEWAY:-}" ]; then
             read -r -p "Enter default gateway IP [$DEFAULT_GATEWAY]: " gateway_input
           else
             read -r -p "Enter default gateway IP: " gateway_input
           fi
           gateway_input=$(normalize_input "$gateway_input")
+          if is_back_command "$gateway_input"; then
+            break
+          fi
           if [ -z "$gateway_input" ] && [ -n "${DEFAULT_GATEWAY:-}" ]; then
             gateway_input=$DEFAULT_GATEWAY
           fi
@@ -1136,6 +1308,395 @@ create_lif_dynamic() {
   api_request "POST" "https://$MGMT_IP/api/network/ip/interfaces?return_timeout=0&return_records=false" "$payload" >/dev/null
 }
 
+prompt_lif_prefix() {
+  local lif_prefix_input
+
+  while true; do
+    echo "Type B to go back to previous question."
+    if [ -n "$LIF_PREFIX" ]; then
+      read -r -p "Enter LIF prefix [$LIF_PREFIX]: " lif_prefix_input
+    else
+      read -r -p "Enter LIF prefix: " lif_prefix_input
+    fi
+    lif_prefix_input=$(normalize_input "$lif_prefix_input")
+    if is_back_command "$lif_prefix_input"; then
+      return 2
+    fi
+    if [ -z "$lif_prefix_input" ] && [ -n "$LIF_PREFIX" ]; then
+      lif_prefix_input=$LIF_PREFIX
+    fi
+    if [ -z "$lif_prefix_input" ]; then
+      echo "LIF prefix is required." >&2
+      continue
+    fi
+    LIF_PREFIX=$lif_prefix_input
+    return
+  done
+}
+
+prompt_target_nodes() {
+  local rc
+  local nodes_json
+
+  while true; do
+    if prompt_node_name NODE1 "Enter node 1 name" "true"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+      return "$rc"
+    fi
+
+    if [ "$NODE1" = "__ALL__" ]; then
+      nodes_json=$(get_nodes_json)
+      TARGET_NODES=()
+      while IFS= read -r node_name; do
+        if [ -n "$node_name" ]; then
+          TARGET_NODES+=("$node_name")
+        fi
+      done < <(get_all_node_names "$nodes_json")
+      if [ "${#TARGET_NODES[@]}" -eq 0 ]; then
+        echo "No node names returned by the API." >&2
+        exit 1
+      fi
+      return
+    fi
+
+    if prompt_node_name NODE2 "Enter node 2 name"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
+      TARGET_NODES=("$NODE1" "$NODE2")
+      return
+    fi
+    if [ "$rc" -eq 2 ]; then
+      continue
+    fi
+    return "$rc"
+  done
+}
+
+prompt_multiplier_value() {
+  local multiplier_input
+
+  while true; do
+    echo "Type B to go back to previous question."
+    if [ -n "$LIFS_PER_NODE" ]; then
+      read -r -p "Enter multiplier (number of LIFs per node) [$LIFS_PER_NODE]: " multiplier_input
+    else
+      read -r -p "Enter multiplier (number of LIFs per node): " multiplier_input
+    fi
+    multiplier_input=$(normalize_input "$multiplier_input")
+    if is_back_command "$multiplier_input"; then
+      return 2
+    fi
+    if [ -z "$multiplier_input" ] && [ -n "$LIFS_PER_NODE" ]; then
+      multiplier_input=$LIFS_PER_NODE
+    fi
+    if ! is_positive_integer "$multiplier_input"; then
+      echo "Multiplier must be a positive integer." >&2
+      continue
+    fi
+    LIFS_PER_NODE=$multiplier_input
+    return
+  done
+}
+
+prompt_data_port_strategy() {
+  local same_port_choice
+  local balance_ports_choice
+  local data_port_input
+  local data_ports_input
+  local default_port_value
+
+  while true; do
+    echo "Type B to go back to previous question."
+    read -r -p "Use the same data port on all nodes? [y/N]: " same_port_choice
+    same_port_choice=$(normalize_input "$same_port_choice")
+    if is_back_command "$same_port_choice"; then
+      return 2
+    fi
+    same_port_choice=${same_port_choice,,}
+    case "$same_port_choice" in
+      y|yes)
+        USE_SAME_DATA_PORT=true
+        BALANCE_ACROSS_PORTS=false
+        while true; do
+          echo "Type B to go back to previous question."
+          default_port_value=""
+          if validate_data_ports "$DATA_PORTS" >/dev/null 2>&1; then
+            default_port_value=${DATA_PORT_LIST[0]}
+          fi
+          if [ -n "$default_port_value" ]; then
+            read -r -p "Enter data port name [$default_port_value]: " data_port_input
+          else
+            read -r -p "Enter data port name: " data_port_input
+          fi
+          data_port_input=$(normalize_input "$data_port_input")
+          if is_back_command "$data_port_input"; then
+            break
+          fi
+          if [ -z "$data_port_input" ] && [ -n "$default_port_value" ]; then
+            data_port_input=$default_port_value
+          fi
+          if validate_data_ports "$data_port_input"; then
+            DATA_PORTS=$data_port_input
+            return
+          fi
+        done
+        ;;
+      ""|n|no)
+        USE_SAME_DATA_PORT=false
+        if [ "$LIFS_PER_NODE" -gt 1 ]; then
+          while true; do
+            echo "Type B to go back to previous question."
+            read -r -p "Balance interfaces across ports on each node? [y/N]: " balance_ports_choice
+            balance_ports_choice=$(normalize_input "$balance_ports_choice")
+            if is_back_command "$balance_ports_choice"; then
+              break
+            fi
+            balance_ports_choice=${balance_ports_choice,,}
+            case "$balance_ports_choice" in
+              y|yes)
+                BALANCE_ACROSS_PORTS=true
+                ;;
+              ""|n|no)
+                BALANCE_ACROSS_PORTS=false
+                ;;
+              *)
+                echo "Please enter y or n." >&2
+                continue
+                ;;
+            esac
+
+            while true; do
+              echo "Type B to go back to previous question."
+              if [ -n "$DATA_PORTS" ]; then
+                read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
+              else
+                read -r -p "Enter data ports to use (comma-separated): " data_ports_input
+              fi
+              data_ports_input=$(normalize_input "$data_ports_input")
+              if is_back_command "$data_ports_input"; then
+                break
+              fi
+              if [ -z "$data_ports_input" ] && [ -n "$DATA_PORTS" ]; then
+                data_ports_input=$DATA_PORTS
+              fi
+              if validate_data_ports "$data_ports_input"; then
+                DATA_PORTS=$data_ports_input
+                return
+              fi
+            done
+          done
+        else
+          BALANCE_ACROSS_PORTS=false
+          while true; do
+            echo "Type B to go back to previous question."
+            if [ -n "$DATA_PORTS" ]; then
+              read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
+            else
+              read -r -p "Enter data ports to use (comma-separated): " data_ports_input
+            fi
+            data_ports_input=$(normalize_input "$data_ports_input")
+            if is_back_command "$data_ports_input"; then
+              break
+            fi
+            if [ -z "$data_ports_input" ] && [ -n "$DATA_PORTS" ]; then
+              data_ports_input=$DATA_PORTS
+            fi
+            if validate_data_ports "$data_ports_input"; then
+              DATA_PORTS=$data_ports_input
+              return
+            fi
+          done
+        fi
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+}
+
+prompt_subnet_dynamic_choice() {
+  local use_subnet_choice
+
+  while true; do
+    echo "Type B to go back to previous question."
+    read -r -p "Use network subnets to provision IPs dynamically? [y/N]: " use_subnet_choice
+    use_subnet_choice=$(normalize_input "$use_subnet_choice")
+    if is_back_command "$use_subnet_choice"; then
+      return 2
+    fi
+    use_subnet_choice=${use_subnet_choice,,}
+    case "$use_subnet_choice" in
+      y|yes)
+        USE_SUBNET_DYNAMIC=true
+        return
+        ;;
+      ""|n|no)
+        USE_SUBNET_DYNAMIC=false
+        return
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+}
+
+set_required_lif_count() {
+  required_lif_count=$(( ${#TARGET_NODES[@]} * LIFS_PER_NODE ))
+  if [ "$required_lif_count" -le 0 ]; then
+    echo "Calculated LIF count is invalid." >&2
+    exit 1
+  fi
+}
+
+prompt_static_networking() {
+  local data_mask_input
+  local data_ips_input
+  local static_step="netmask"
+
+  set_required_lif_count
+
+  while true; do
+    case "$static_step" in
+      netmask)
+        echo "Type B to go back to previous question."
+        if [ -n "$DATA_MASK" ]; then
+          read -r -p "Enter netmask in dotted decimal [$DATA_MASK]: " data_mask_input
+        else
+          read -r -p "Enter netmask in dotted decimal: " data_mask_input
+        fi
+        data_mask_input=$(normalize_input "$data_mask_input")
+        if is_back_command "$data_mask_input"; then
+          return 2
+        fi
+        if [ -z "$data_mask_input" ] && [ -n "$DATA_MASK" ]; then
+          data_mask_input=$DATA_MASK
+        fi
+        if ! is_valid_ipv4 "$data_mask_input"; then
+          echo "Netmask must be a valid dotted IPv4 value." >&2
+          continue
+        fi
+        DATA_MASK=$data_mask_input
+        static_step="ips"
+        ;;
+      ips)
+        echo "Type B to go back to previous question."
+        if [ -n "$DATA_IPS" ]; then
+          read -r -p "Enter $required_lif_count data interface IPs (comma-separated) [$DATA_IPS]: " data_ips_input
+        else
+          read -r -p "Enter $required_lif_count data interface IPs (comma-separated): " data_ips_input
+        fi
+        data_ips_input=$(normalize_input "$data_ips_input")
+        if is_back_command "$data_ips_input"; then
+          static_step="netmask"
+          continue
+        fi
+        if [ -z "$data_ips_input" ] && [ -n "$DATA_IPS" ]; then
+          data_ips_input=$DATA_IPS
+        fi
+        if validate_data_ips "$data_ips_input"; then
+          if [ "${#DATA_IP_LIST[@]}" -ne "$required_lif_count" ]; then
+            echo "Expected $required_lif_count IP addresses, but received ${#DATA_IP_LIST[@]}." >&2
+            continue
+          fi
+          DATA_IPS=$data_ips_input
+          return
+        fi
+        ;;
+    esac
+  done
+}
+
+build_interface_plan() {
+  local node_index
+  local node_name
+  local per_node_index
+  local selected_port
+  local lif_name
+  local ip_value
+
+  PLANNED_NAMES=()
+  PLANNED_NODES=()
+  PLANNED_PORTS=()
+  PLANNED_IPS=()
+
+  set_required_lif_count
+
+  plan_index=0
+  for node_index in "${!TARGET_NODES[@]}"; do
+    node_name=${TARGET_NODES[$node_index]}
+    per_node_index=1
+    while [ "$per_node_index" -le "$LIFS_PER_NODE" ]; do
+      selected_port=$(select_port_for_plan "$node_index" "$per_node_index")
+
+      if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+        lif_name=$(build_lif_name_dynamic "$node_name" "$per_node_index")
+        ip_value="-"
+      else
+        ip_value=${DATA_IP_LIST[$plan_index]}
+        lif_name=$(build_lif_name "$ip_value")
+      fi
+
+      PLANNED_NAMES+=("$lif_name")
+      PLANNED_NODES+=("$node_name")
+      PLANNED_PORTS+=("$selected_port")
+      PLANNED_IPS+=("$ip_value")
+
+      plan_index=$((plan_index + 1))
+      per_node_index=$((per_node_index + 1))
+    done
+  done
+}
+
+show_interface_plan() {
+  local idx
+
+  echo
+  echo "Interfaces to create in SVM '$SVM':"
+  for idx in "${!PLANNED_NAMES[@]}"; do
+    if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+      echo "  - ${PLANNED_NAMES[$idx]} (subnet: $SUBNET_NAME) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
+    else
+      echo "  - ${PLANNED_NAMES[$idx]} (${PLANNED_IPS[$idx]}) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
+    fi
+  done
+  echo
+}
+
+prompt_creation_confirmation() {
+  local confirm_create
+
+  while true; do
+    echo "Type B to go back to previous question."
+    read -r -p "Proceed to create ${#PLANNED_NAMES[@]} interface(s)? [y/N]: " confirm_create
+    confirm_create=$(normalize_input "$confirm_create")
+    if is_back_command "$confirm_create"; then
+      return 2
+    fi
+    confirm_create=${confirm_create,,}
+    case "$confirm_create" in
+      y|yes)
+        return
+        ;;
+      ""|n|no)
+        echo "Cancelled."
+        return 3
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+}
+
 parse_args "$@"
 init_debug_logging
 
@@ -1154,7 +1715,12 @@ DATA_PORT1=${DATA_PORT1:-}
 DATA_PORT2=${DATA_PORT2:-}
 DATA_PORTS=${DATA_PORTS:-}
 DATA_IPS=${DATA_IPS:-}
+BROADCAST_DOMAIN_NAME=${BROADCAST_DOMAIN_NAME:-}
+IPSPACE_NAME=${IPSPACE_NAME:-}
 SUBNET_NAME=${SUBNET_NAME:-}
+SUBNET_CIDR=${SUBNET_CIDR:-}
+SUBNET_IP_RANGES_INPUT=${SUBNET_IP_RANGES_INPUT:-}
+SUBNET_IP_RANGES_JSON=${SUBNET_IP_RANGES_JSON:-[]}
 LIFS_PER_NODE=${LIFS_PER_NODE:-${MULTIPLIER:-1}}
 USE_SUBNET_DYNAMIC=${USE_SUBNET_DYNAMIC:-false}
 USE_SAME_DATA_PORT=${USE_SAME_DATA_PORT:-false}
@@ -1188,262 +1754,156 @@ fi
 
 prompt_if_empty MGMT_IP "Enter cluster management IP: "
 prompt_auth_token
-prompt_svm_name
-ensure_default_gateway_for_svm
-
+wizard_step="svm"
 while true; do
-  if [ -n "$LIF_PREFIX" ]; then
-    read -r -p "Enter LIF prefix [$LIF_PREFIX]: " lif_prefix_input
-  else
-    read -r -p "Enter LIF prefix: " lif_prefix_input
-  fi
-  lif_prefix_input=$(normalize_input "$lif_prefix_input")
-  if [ -z "$lif_prefix_input" ] && [ -n "$LIF_PREFIX" ]; then
-    lif_prefix_input=$LIF_PREFIX
-  fi
-  if [ -z "$lif_prefix_input" ]; then
-    echo "LIF prefix is required." >&2
-    continue
-  fi
-  LIF_PREFIX=$lif_prefix_input
-  break
-done
-
-prompt_node_name NODE1 "Enter node 1 name" "true"
-if [ "$NODE1" = "__ALL__" ]; then
-  nodes_json=$(get_nodes_json)
-  TARGET_NODES=()
-  while IFS= read -r node_name; do
-    if [ -n "$node_name" ]; then
-      TARGET_NODES+=("$node_name")
-    fi
-  done < <(get_all_node_names "$nodes_json")
-  if [ "${#TARGET_NODES[@]}" -eq 0 ]; then
-    echo "No node names returned by the API." >&2
-    exit 1
-  fi
-else
-  prompt_node_name NODE2 "Enter node 2 name"
-  TARGET_NODES=("$NODE1" "$NODE2")
-fi
-
-while true; do
-  if [ -n "$LIFS_PER_NODE" ]; then
-    read -r -p "Enter multiplier (number of LIFs per node) [$LIFS_PER_NODE]: " multiplier_input
-  else
-    read -r -p "Enter multiplier (number of LIFs per node): " multiplier_input
-  fi
-  multiplier_input=$(normalize_input "$multiplier_input")
-  if [ -z "$multiplier_input" ] && [ -n "$LIFS_PER_NODE" ]; then
-    multiplier_input=$LIFS_PER_NODE
-  fi
-  if ! is_positive_integer "$multiplier_input"; then
-    echo "Multiplier must be a positive integer." >&2
-    continue
-  fi
-  LIFS_PER_NODE=$multiplier_input
-  break
-done
-
-while true; do
-  read -r -p "Use the same data port on all nodes? [y/N]: " same_port_choice
-  same_port_choice=$(normalize_input "$same_port_choice")
-  same_port_choice=${same_port_choice,,}
-  case "$same_port_choice" in
-    y|yes)
-      USE_SAME_DATA_PORT=true
-      BALANCE_ACROSS_PORTS=false
-      while true; do
-        default_port_value=""
-        if validate_data_ports "$DATA_PORTS" >/dev/null 2>&1; then
-          default_port_value=${DATA_PORT_LIST[0]}
-        fi
-        if [ -n "$default_port_value" ]; then
-          read -r -p "Enter data port name [$default_port_value]: " data_port_input
-        else
-          read -r -p "Enter data port name: " data_port_input
-        fi
-        data_port_input=$(normalize_input "$data_port_input")
-        if [ -z "$data_port_input" ] && [ -n "$default_port_value" ]; then
-          data_port_input=$default_port_value
-        fi
-        if validate_data_ports "$data_port_input"; then
-          DATA_PORTS=$data_port_input
-          break
-        fi
-      done
-      break
-      ;;
-    ""|n|no)
-      USE_SAME_DATA_PORT=false
-      if [ "$LIFS_PER_NODE" -gt 1 ]; then
-        while true; do
-          read -r -p "Balance interfaces across ports on each node? [y/N]: " balance_ports_choice
-          balance_ports_choice=$(normalize_input "$balance_ports_choice")
-          balance_ports_choice=${balance_ports_choice,,}
-          case "$balance_ports_choice" in
-            y|yes)
-              BALANCE_ACROSS_PORTS=true
-              break
-              ;;
-            ""|n|no)
-              BALANCE_ACROSS_PORTS=false
-              break
-              ;;
-            *)
-              echo "Please enter y or n." >&2
-              ;;
-          esac
-        done
+  case "$wizard_step" in
+    svm)
+      if prompt_svm_name; then
+        rc=0
       else
-        BALANCE_ACROSS_PORTS=false
+        rc=$?
       fi
-
-      while true; do
-        if [ -n "$DATA_PORTS" ]; then
-          read -r -p "Enter data ports to use (comma-separated) [$DATA_PORTS]: " data_ports_input
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="default_gateway"
+      fi
+      ;;
+    default_gateway)
+      if ensure_default_gateway_for_svm; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="lif_prefix"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="svm"
+      else
+        exit "$rc"
+      fi
+      ;;
+    lif_prefix)
+      if prompt_lif_prefix; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="nodes"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="default_gateway"
+      else
+        exit "$rc"
+      fi
+      ;;
+    nodes)
+      if prompt_target_nodes; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="multiplier"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="lif_prefix"
+      else
+        exit "$rc"
+      fi
+      ;;
+    multiplier)
+      if prompt_multiplier_value; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="ports"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="nodes"
+      else
+        exit "$rc"
+      fi
+      ;;
+    ports)
+      if prompt_data_port_strategy; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="dynamic_subnet"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="multiplier"
+      else
+        exit "$rc"
+      fi
+      ;;
+    dynamic_subnet)
+      if prompt_subnet_dynamic_choice; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+          wizard_step="subnet"
         else
-          read -r -p "Enter data ports to use (comma-separated): " data_ports_input
+          wizard_step="static_networking"
         fi
-        data_ports_input=$(normalize_input "$data_ports_input")
-        if [ -z "$data_ports_input" ] && [ -n "$DATA_PORTS" ]; then
-          data_ports_input=$DATA_PORTS
-        fi
-        if validate_data_ports "$data_ports_input"; then
-          DATA_PORTS=$data_ports_input
-          break
-        fi
-      done
-      break
-      ;;
-    *)
-      echo "Please enter y or n." >&2
-      ;;
-  esac
-done
-
-while true; do
-  read -r -p "Use network subnets to provision IPs dynamically? [y/N]: " use_subnet_choice
-  use_subnet_choice=$(normalize_input "$use_subnet_choice")
-  use_subnet_choice=${use_subnet_choice,,}
-  case "$use_subnet_choice" in
-    y|yes)
-      USE_SUBNET_DYNAMIC=true
-      break
-      ;;
-    ""|n|no)
-      USE_SUBNET_DYNAMIC=false
-      break
-      ;;
-    *)
-      echo "Please enter y or n." >&2
-      ;;
-  esac
-done
-
-required_lif_count=$(( ${#TARGET_NODES[@]} * LIFS_PER_NODE ))
-if [ "$required_lif_count" -le 0 ]; then
-  echo "Calculated LIF count is invalid." >&2
-  exit 1
-fi
-
-if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
-  prompt_subnet_name
-else
-  while true; do
-    if [ -n "$DATA_MASK" ]; then
-      read -r -p "Enter netmask in dotted decimal [$DATA_MASK]: " data_mask_input
-    else
-      read -r -p "Enter netmask in dotted decimal: " data_mask_input
-    fi
-    data_mask_input=$(normalize_input "$data_mask_input")
-    if [ -z "$data_mask_input" ] && [ -n "$DATA_MASK" ]; then
-      data_mask_input=$DATA_MASK
-    fi
-    if ! is_valid_ipv4 "$data_mask_input"; then
-      echo "Netmask must be a valid dotted IPv4 value." >&2
-      continue
-    fi
-    DATA_MASK=$data_mask_input
-    break
-  done
-
-  while true; do
-    if [ -n "$DATA_IPS" ]; then
-      read -r -p "Enter $required_lif_count data interface IPs (comma-separated) [$DATA_IPS]: " data_ips_input
-    else
-      read -r -p "Enter $required_lif_count data interface IPs (comma-separated): " data_ips_input
-    fi
-    data_ips_input=$(normalize_input "$data_ips_input")
-    if [ -z "$data_ips_input" ] && [ -n "$DATA_IPS" ]; then
-      data_ips_input=$DATA_IPS
-    fi
-    if validate_data_ips "$data_ips_input"; then
-      if [ "${#DATA_IP_LIST[@]}" -ne "$required_lif_count" ]; then
-        echo "Expected $required_lif_count IP addresses, but received ${#DATA_IP_LIST[@]}." >&2
-        continue
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="ports"
+      else
+        exit "$rc"
       fi
-      DATA_IPS=$data_ips_input
-      break
-    fi
-  done
-fi
-
-PLANNED_NAMES=()
-PLANNED_NODES=()
-PLANNED_PORTS=()
-PLANNED_IPS=()
-
-plan_index=0
-for node_index in "${!TARGET_NODES[@]}"; do
-  node_name=${TARGET_NODES[$node_index]}
-  per_node_index=1
-  while [ "$per_node_index" -le "$LIFS_PER_NODE" ]; do
-    selected_port=$(select_port_for_plan "$node_index" "$per_node_index")
-
-    if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
-      lif_name=$(build_lif_name_dynamic "$node_name" "$per_node_index")
-      ip_value="-"
-    else
-      ip_value=${DATA_IP_LIST[$plan_index]}
-      lif_name=$(build_lif_name "$ip_value")
-    fi
-
-    PLANNED_NAMES+=("$lif_name")
-    PLANNED_NODES+=("$node_name")
-    PLANNED_PORTS+=("$selected_port")
-    PLANNED_IPS+=("$ip_value")
-
-    plan_index=$((plan_index + 1))
-    per_node_index=$((per_node_index + 1))
-  done
-done
-
-echo
-echo "Interfaces to create in SVM '$SVM':"
-for idx in "${!PLANNED_NAMES[@]}"; do
-  if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
-    echo "  - ${PLANNED_NAMES[$idx]} (subnet: $SUBNET_NAME) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
-  else
-    echo "  - ${PLANNED_NAMES[$idx]} (${PLANNED_IPS[$idx]}) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
-  fi
-done
-echo
-
-while true; do
-  read -r -p "Proceed to create ${#PLANNED_NAMES[@]} interface(s)? [y/N]: " confirm_create
-  confirm_create=$(normalize_input "$confirm_create")
-  confirm_create=${confirm_create,,}
-  case "$confirm_create" in
-    y|yes)
-      break
       ;;
-    ""|n|no)
-      echo "Cancelled."
-      exit 0
+    subnet)
+      if prompt_subnet_name; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="confirm"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="dynamic_subnet"
+      else
+        exit "$rc"
+      fi
       ;;
-    *)
-      echo "Please enter y or n." >&2
+    static_networking)
+      if prompt_static_networking; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="confirm"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="dynamic_subnet"
+      else
+        exit "$rc"
+      fi
+      ;;
+    confirm)
+      build_interface_plan
+      show_interface_plan
+      if prompt_creation_confirmation; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        break
+      elif [ "$rc" -eq 2 ]; then
+        if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
+          wizard_step="subnet"
+        else
+          wizard_step="static_networking"
+        fi
+      elif [ "$rc" -eq 3 ]; then
+        exit 0
+      else
+        exit "$rc"
+      fi
       ;;
   esac
 done
