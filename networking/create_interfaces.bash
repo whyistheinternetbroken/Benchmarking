@@ -401,6 +401,93 @@ get_ethernet_ports_json() {
   api_request "GET" "https://$MGMT_IP/api/network/ethernet/ports?fields=name,node.name&return_records=true&return_timeout=15&max_records=10000"
 }
 
+load_node_ports() {
+  local node_name=$1
+
+  if [ -z "$ETHERNET_PORTS_JSON" ]; then
+    ETHERNET_PORTS_JSON=$(get_ethernet_ports_json)
+  fi
+
+  mapfile -t NODE_PORT_NAMES < <(
+    printf '%s' "$ETHERNET_PORTS_JSON" | jq -r --arg node "$node_name" '
+      .records[]
+      | select((.node.name // "") == $node)
+      | .name // empty
+    ' | sort
+  )
+}
+
+append_unique_value() {
+  local value=$1
+  local existing
+
+  for existing in "${MATCHED_PORTS[@]}"; do
+    if [ "$existing" = "$value" ]; then
+      return
+    fi
+  done
+
+  MATCHED_PORTS+=("$value")
+}
+
+resolve_balancing_ports_for_node() {
+  local node_name=$1
+  local port_token
+  local port_name
+  local matched=false
+
+  load_node_ports "$node_name"
+  MATCHED_PORTS=()
+
+  for port_token in "${DATA_PORT_LIST[@]}"; do
+    matched=false
+    for port_name in "${NODE_PORT_NAMES[@]}"; do
+      if [ "$port_name" = "$port_token" ]; then
+        append_unique_value "$port_name"
+        matched=true
+        break
+      fi
+    done
+
+    if [ "$matched" = "true" ]; then
+      continue
+    fi
+
+    for port_name in "${NODE_PORT_NAMES[@]}"; do
+      if [[ "$port_name" == "$port_token"* ]]; then
+        append_unique_value "$port_name"
+        matched=true
+      fi
+    done
+  done
+
+  [ "${#MATCHED_PORTS[@]}" -gt 0 ]
+}
+
+resolve_fixed_port_for_node() {
+  local node_name=$1
+  local port_token=$2
+  local port_name
+
+  load_node_ports "$node_name"
+
+  for port_name in "${NODE_PORT_NAMES[@]}"; do
+    if [ "$port_name" = "$port_token" ]; then
+      printf '%s' "$port_name"
+      return 0
+    fi
+  done
+
+  for port_name in "${NODE_PORT_NAMES[@]}"; do
+    if [[ "$port_name" == "$port_token"* ]]; then
+      printf '%s' "$port_name"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 validate_port_families_for_target_nodes() {
   local node_name
   local port_name
@@ -1321,8 +1408,13 @@ select_port_for_plan() {
       echo "No data ports are available for planning." >&2
       exit 1
     fi
+    if ! resolve_balancing_ports_for_node "$node_name"; then
+      echo "No ports on node '$node_name' matched the requested data port values: $DATA_PORTS" >&2
+      exit 1
+    fi
+    port_count=${#MATCHED_PORTS[@]}
     selected_index=$(( (per_node_index - 1) % port_count ))
-    printf '%s' "${DATA_PORT_LIST[$selected_index]}"
+    printf '%s' "${MATCHED_PORTS[$selected_index]}"
     return
   fi
 
@@ -1371,7 +1463,12 @@ select_port_for_plan() {
   fi
 
   selected_index=$(( node_index % port_count ))
-  printf '%s' "${DATA_PORT_LIST[$selected_index]}"
+  if resolve_fixed_port_for_node "$node_name" "${DATA_PORT_LIST[$selected_index]}"; then
+    return
+  fi
+
+  echo "Port '${DATA_PORT_LIST[$selected_index]}' did not match any ports on node '$node_name'." >&2
+  exit 1
 }
 
 build_payload_static() {
