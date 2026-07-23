@@ -214,6 +214,81 @@ prompt_auth_token() {
   done
 }
 
+get_data_svms_json() {
+  api_request "GET" "https://$MGMT_IP/api/svm/svms?fields=name,subtype&return_records=true&return_timeout=15&max_records=10000"
+}
+
+show_svms() {
+  local svms_json=$1
+  local rows
+
+  rows=$(printf '%s' "$svms_json" | jq -r '
+    .records[]
+    | [.name, (.subtype // "-")]
+    | @tsv
+  ' | sort)
+
+  if [ -z "$rows" ]; then
+    echo "No SVMs returned by the API."
+    return
+  fi
+
+  echo
+  echo "Available SVM names:"
+  while IFS=$'\t' read -r svm_name svm_subtype; do
+    echo "  - $svm_name ($svm_subtype)"
+  done <<< "$rows"
+  echo
+}
+
+svm_exists() {
+  local svm_name=$1
+  local svms_json=$2
+  local count
+  count=$(printf '%s' "$svms_json" | jq -r --arg svm "$svm_name" '[.records[] | select(.name == $svm)] | length')
+  [ "$count" -gt 0 ]
+}
+
+prompt_svm_name() {
+  local current_value=${SVM:-}
+  local input_value
+  local svms_json
+
+  while true; do
+    echo "Provide ? to list SVM names"
+    if [ -n "$current_value" ]; then
+      read -r -p "Enter SVM name [$current_value]: " input_value
+    else
+      read -r -p "Enter SVM name: " input_value
+    fi
+
+    input_value=$(normalize_input "$input_value")
+    if [ "$input_value" = "?" ]; then
+      svms_json=$(get_data_svms_json)
+      show_svms "$svms_json"
+      continue
+    fi
+
+    if [ -z "$input_value" ] && [ -n "$current_value" ]; then
+      input_value=$current_value
+    fi
+
+    if [ -z "$input_value" ]; then
+      echo "SVM is required." >&2
+      continue
+    fi
+
+    svms_json=$(get_data_svms_json)
+    if ! svm_exists "$input_value" "$svms_json"; then
+      echo "SVM '$input_value' was not found. Type ? to list available SVM names." >&2
+      continue
+    fi
+
+    SVM=$input_value
+    return
+  done
+}
+
 is_valid_ipv4() {
   local ip=$1
   local IFS=.
@@ -1113,7 +1188,7 @@ fi
 
 prompt_if_empty MGMT_IP "Enter cluster management IP: "
 prompt_auth_token
-prompt_if_empty SVM "Enter SVM name: "
+prompt_svm_name
 ensure_default_gateway_for_svm
 
 while true; do
