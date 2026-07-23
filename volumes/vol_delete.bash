@@ -478,71 +478,6 @@ show_target_volumes() {
   printf '\n'
 }
 
-wait_for_volume_state() {
-  local volume_uuid=$1
-  local expected_state=$2
-  local volume_name=$3
-  local attempts=60
-  local attempt=1
-  local volume_json
-  local current_state
-
-  while [ "$attempt" -le "$attempts" ]; do
-    volume_json=$(api_request "GET" "https://$MGMT_IP/api/storage/volumes/$volume_uuid?fields=state")
-    current_state=$(printf '%s' "$volume_json" | jq -r '.state // ""')
-    if [ "$current_state" = "$expected_state" ]; then
-      return
-    fi
-    sleep 2
-    attempt=$((attempt + 1))
-  done
-
-  echo "Timed out waiting for volume '$volume_name' to reach state '$expected_state'." >&2
-  exit 1
-}
-
-wait_for_volume_unmounted() {
-  local volume_uuid=$1
-  local volume_name=$2
-  local attempts=60
-  local attempt=1
-  local volume_json
-  local current_path
-
-  while [ "$attempt" -le "$attempts" ]; do
-    volume_json=$(api_request "GET" "https://$MGMT_IP/api/storage/volumes/$volume_uuid?fields=nas.path")
-    current_path=$(printf '%s' "$volume_json" | jq -r '.nas.path // ""')
-    if [ -z "$current_path" ]; then
-      return
-    fi
-    sleep 2
-    attempt=$((attempt + 1))
-  done
-
-  echo "Timed out waiting for volume '$volume_name' to unmount." >&2
-  exit 1
-}
-
-offline_volume() {
-  local volume_uuid=$1
-  local volume_name=$2
-  local payload='{"state":"offline"}'
-
-  echo "Offlining volume: $volume_name"
-  api_request "PATCH" "https://$MGMT_IP/api/storage/volumes/$volume_uuid?return_timeout=0&return_records=false" "$payload" >/dev/null
-  wait_for_volume_state "$volume_uuid" "offline" "$volume_name"
-}
-
-unmount_volume() {
-  local volume_uuid=$1
-  local volume_name=$2
-  local payload='{"nas":{"path":null}}'
-
-  echo "Unmounting volume: $volume_name"
-  api_request "PATCH" "https://$MGMT_IP/api/storage/volumes/$volume_uuid?return_timeout=0&return_records=false" "$payload" >/dev/null
-  wait_for_volume_unmounted "$volume_uuid" "$volume_name"
-}
-
 delete_volume() {
   local volume_uuid=$1
   local volume_name=$2
@@ -564,6 +499,7 @@ REST translation notes:
 - ONTAP CLI diagnostic context toggles (set diag -c / set diag -c off) do not have a REST equivalent.
 - CLI wildcard/list forms (for example vol1,vol2 or vol*) are resolved client-side here, then REST calls run per volume UUID.
 - CLI -foreground false is represented by asynchronous REST calls using return_timeout=0.
+- This script deletes selected volumes directly (no offline/unmount pre-step).
 EOF
   printf '\n'
 }
@@ -684,7 +620,7 @@ while true; do
 done
 
 while true; do
-  read -r -p "Proceed to offline, unmount, and delete ${#TARGET_NAMES[@]} volume(s) from SVM '$SVM'? [y/N]: " confirm_delete
+  read -r -p "Proceed to delete ${#TARGET_NAMES[@]} volume(s) from SVM '$SVM'? [y/N]: " confirm_delete
   confirm_delete=$(normalize_input "$confirm_delete")
   confirm_delete=${confirm_delete,,}
   case "$confirm_delete" in
@@ -704,8 +640,6 @@ done
 for idx in "${!TARGET_NAMES[@]}"; do
   volume_name=${TARGET_NAMES[$idx]}
   volume_uuid=${TARGET_UUIDS[$idx]}
-  offline_volume "$volume_uuid" "$volume_name"
-  unmount_volume "$volume_uuid" "$volume_name"
   delete_volume "$volume_uuid" "$volume_name"
 done
 
