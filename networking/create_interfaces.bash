@@ -616,6 +616,17 @@ broadcast_domain_exists() {
   [ "$count" -gt 0 ]
 }
 
+get_broadcast_domain_ipspace_name() {
+  local broadcast_domain_name=$1
+  local broadcast_domains_json=$2
+
+  printf '%s' "$broadcast_domains_json" | jq -r --arg name "$broadcast_domain_name" '
+    .records[]
+    | select(.name == $name)
+    | .ipspace.name // empty
+  ' | head -n 1
+}
+
 ipspace_exists() {
   local ipspace_name=$1
   local ipspaces_json=$2
@@ -784,11 +795,23 @@ prompt_ipspace_name_optional() {
 
 create_subnet() {
   local payload
+  local effective_ipspace_name="${IPSPACE_NAME:-}"
+  local broadcast_domains_json
+
+  if [ -z "$effective_ipspace_name" ]; then
+    broadcast_domains_json=$(get_broadcast_domains_json)
+    effective_ipspace_name=$(get_broadcast_domain_ipspace_name "$BROADCAST_DOMAIN_NAME" "$broadcast_domains_json")
+  fi
+
+  if [ -n "${SUBNET_GATEWAY:-}" ] && [ -z "$effective_ipspace_name" ]; then
+    echo "Unable to determine the IPspace for broadcast domain '$BROADCAST_DOMAIN_NAME'. A subnet gateway requires an IPspace." >&2
+    return 1
+  fi
 
   payload=$(jq -n \
     --arg subnet_name "$SUBNET_NAME" \
     --arg broadcast_domain_name "$BROADCAST_DOMAIN_NAME" \
-    --arg ipspace_name "${IPSPACE_NAME:-}" \
+    --arg ipspace_name "$effective_ipspace_name" \
     --arg subnet_address "$SUBNET_ADDRESS" \
     --arg subnet_netmask "$SUBNET_NETMASK" \
     --argjson ip_ranges "${SUBNET_IP_RANGES_JSON:-[]}" \
@@ -920,8 +943,10 @@ prompt_and_create_subnet() {
           continue
         fi
         SUBNET_GATEWAY=$subnet_gateway_input
-        create_subnet
-        return
+        if create_subnet; then
+          return
+        fi
+        continue
         ;;
     esac
   done
