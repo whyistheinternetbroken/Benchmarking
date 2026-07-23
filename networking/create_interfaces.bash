@@ -54,10 +54,21 @@ print_usage() {
   cat <<'EOF'
 Usage: create_interfaces.bash [--debug]
 
+Creates ONTAP SVM interfaces (LIFs) through an interactive wizard.
+
 Options:
   --debug   Enable verbose REST request/response tracing to a log file.
             Default path: <networking>/logs/create_interfaces_debug_YYYYmmdd_HHMMSS.log
             Optional: set DEBUG_LOG_FILE=/path/to/file.log
+
+Environment variables (optional):
+  MGMT_IP, AUTH_TOK, SVM, LIF_PREFIX, LIFS_PER_NODE
+  DATA_PORTS, DATA_PORT_FAMILIES, DATA_MASK, DATA_IPS
+  USE_SUBNET_DYNAMIC, SUBNET_NAME
+
+Prompt tips:
+  - Type ? in lookup prompts to list available objects.
+  - Type B to go back to the previous wizard question.
 EOF
 }
 

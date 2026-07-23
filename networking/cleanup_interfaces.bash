@@ -50,10 +50,25 @@ print_usage() {
   cat <<'EOF'
 Usage: cleanup_interfaces.bash [--debug]
 
+Deletes ONTAP network objects through an interactive wizard:
+  - SVM interfaces (LIFs)
+  - Subnets
+  - SVM default routes
+
 Options:
   --debug   Enable verbose REST request/response tracing to a log file.
             Default path: <networking>/logs/cleanup_interfaces_debug_YYYYmmdd_HHMMSS.log
             Optional: set DEBUG_LOG_FILE=/path/to/file.log
+
+Environment variables (optional):
+  MGMT_IP, AUTH_TOK, SVM
+
+Prompt tips:
+  - Type ? where offered to list available objects.
+  - Use numbered selection for LIF/subnet cleanup:
+      0 = none
+      <ALL option number> = all
+      !N = all except item N
 EOF
 }
 
@@ -508,6 +523,116 @@ show_subnets() {
   echo
 }
 
+build_subnet_inventory() {
+  local subnets_json=$1
+  local name
+  local uuid
+
+  ALL_SUBNET_NAMES=()
+  ALL_SUBNET_UUIDS=()
+
+  while IFS=$'\t' read -r name uuid; do
+    ALL_SUBNET_NAMES+=("$name")
+    ALL_SUBNET_UUIDS+=("$uuid")
+  done < <(printf '%s' "$subnets_json" | jq -r '.records[] | [.name, .uuid] | @tsv' | sort -V)
+}
+
+show_subnets_numbered() {
+  local subnets_json=$1
+  local idx
+  local all_option_number
+
+  build_subnet_inventory "$subnets_json"
+  all_option_number=$(( ${#ALL_SUBNET_NAMES[@]} + 1 ))
+
+  echo
+  echo "Available subnets:"
+  for idx in "${!ALL_SUBNET_NAMES[@]}"; do
+    echo "  $((idx + 1))) ${ALL_SUBNET_NAMES[$idx]}"
+  done
+  echo "  $all_option_number) ALL subnets"
+  echo "  0) No subnets"
+  echo
+}
+
+resolve_subnet_selection_by_number() {
+  local selection=$1
+  local all_option_number=$2
+  local normalized
+  local except_index
+  local one_based_index
+  local idx
+  local raw_item
+  local -a selected_indices=()
+
+  TARGET_SUBNET_NAMES=()
+  TARGET_SUBNET_UUIDS=()
+
+  normalized=$(normalize_input "$selection")
+  if [ -z "$normalized" ]; then
+    echo "Selection is required." >&2
+    return 1
+  fi
+
+  if [ "$normalized" = "0" ]; then
+    return 0
+  fi
+
+  if [[ "$normalized" == !* ]]; then
+    except_index=${normalized#!}
+    if [[ ! "$except_index" =~ ^[0-9]+$ ]]; then
+      echo "Use !<number> to keep one subnet and delete all others." >&2
+      return 1
+    fi
+    if [ "$except_index" -lt 1 ] || [ "$except_index" -gt "${#ALL_SUBNET_NAMES[@]}" ]; then
+      echo "Invalid subnet number for !selection: $except_index" >&2
+      return 1
+    fi
+    for idx in "${!ALL_SUBNET_NAMES[@]}"; do
+      one_based_index=$((idx + 1))
+      if [ "$one_based_index" -ne "$except_index" ]; then
+        TARGET_SUBNET_NAMES+=("${ALL_SUBNET_NAMES[$idx]}")
+        TARGET_SUBNET_UUIDS+=("${ALL_SUBNET_UUIDS[$idx]}")
+      fi
+    done
+    return 0
+  fi
+
+  if [ "$normalized" = "$all_option_number" ]; then
+    TARGET_SUBNET_NAMES=("${ALL_SUBNET_NAMES[@]}")
+    TARGET_SUBNET_UUIDS=("${ALL_SUBNET_UUIDS[@]}")
+    return 0
+  fi
+
+  IFS=',' read -r -a raw_items <<< "$normalized"
+  for raw_item in "${raw_items[@]}"; do
+    raw_item=$(normalize_input "$raw_item")
+    if [ -z "$raw_item" ]; then
+      continue
+    fi
+    if [[ ! "$raw_item" =~ ^[0-9]+$ ]]; then
+      echo "Subnet selections must be numbers, comma-separated, $all_option_number for all, 0 for none, or !number." >&2
+      return 1
+    fi
+    if [ "$raw_item" -lt 1 ] || [ "$raw_item" -gt "${#ALL_SUBNET_NAMES[@]}" ]; then
+      echo "Invalid subnet number: $raw_item" >&2
+      return 1
+    fi
+    selected_indices+=("$raw_item")
+  done
+
+  if [ "${#selected_indices[@]}" -eq 0 ]; then
+    echo "No valid subnet numbers were provided." >&2
+    return 1
+  fi
+
+  for one_based_index in "${selected_indices[@]}"; do
+    idx=$((one_based_index - 1))
+    TARGET_SUBNET_NAMES+=("${ALL_SUBNET_NAMES[$idx]}")
+    TARGET_SUBNET_UUIDS+=("${ALL_SUBNET_UUIDS[$idx]}")
+  done
+}
+
 show_default_routes() {
   local routes_json=$1
   local rows
@@ -721,7 +846,8 @@ prompt_subnets_cleanup() {
   local subnets_json
   local cleanup_choice
   local delete_all_choice
-  local selector_input
+  local subnet_selection_input
+  local all_option_number
 
   subnets_json=$(get_subnets_json)
   if [ "$(printf '%s' "$subnets_json" | jq -r '.num_records // 0')" -eq 0 ]; then
@@ -746,23 +872,26 @@ prompt_subnets_cleanup() {
               ;;
             ""|n|no)
               while true; do
-                print_hint "Provide ? to list subnets"
-                read -r -p "Specify a subnet name or wildcard (for example affx*) to delete: " selector_input
-                selector_input=$(normalize_input "$selector_input")
-                if [ "$selector_input" = "?" ]; then
-                  show_subnets "$subnets_json"
+                show_subnets_numbered "$subnets_json"
+                all_option_number=$(( ${#ALL_SUBNET_NAMES[@]} + 1 ))
+                echo "Delete selected subnets:"
+                print_hint "Use one number, comma-separated numbers, or $all_option_number for all subnets"
+                print_hint "Use 0 to delete no subnets"
+                print_hint "Use !number to delete all except one subnet"
+                read -r -p "Selection: " subnet_selection_input
+                subnet_selection_input=$(normalize_input "$subnet_selection_input")
+                if [ "$subnet_selection_input" = "?" ]; then
                   continue
                 fi
-                if [ -z "$selector_input" ]; then
-                  echo "Subnet selector is required." >&2
+                if [ -z "$subnet_selection_input" ]; then
+                  echo "Subnet selection is required." >&2
                   continue
                 fi
-                resolve_target_subnets "$subnets_json" "$selector_input"
-                if [ ${#TARGET_SUBNET_NAMES[@]} -eq 0 ]; then
-                  echo "No subnets matched '$selector_input'." >&2
+                if resolve_subnet_selection_by_number "$subnet_selection_input" "$all_option_number"; then
+                  return
+                else
                   continue
                 fi
-                return
               done
               ;;
             *)
