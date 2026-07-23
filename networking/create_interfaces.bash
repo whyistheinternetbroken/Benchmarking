@@ -91,6 +91,10 @@ parse_args() {
   done
 }
 
+uri_encode() {
+  jq -nr --arg value "$1" '$value|@uri'
+}
+
 print_auth_token_help() {
   cat <<'EOF'
 How to get the API Basic auth token:
@@ -250,6 +254,177 @@ validate_data_ips() {
   fi
 }
 
+get_nodes_json() {
+  api_request "GET" "https://$MGMT_IP/api/cluster/nodes?fields=name&return_records=true&return_timeout=15&max_records=10000"
+}
+
+show_nodes() {
+  local nodes_json=$1
+  local node_names
+
+  node_names=$(printf '%s' "$nodes_json" | jq -r '.records[].name // empty' | sort)
+  if [ -z "$node_names" ]; then
+    echo "No node names returned by the API."
+    return
+  fi
+
+  echo
+  echo "Available node names:"
+  while IFS= read -r node_name; do
+    echo "  - $node_name"
+  done <<< "$node_names"
+  echo
+}
+
+node_exists() {
+  local node_name=$1
+  local nodes_json=$2
+  local count
+  count=$(printf '%s' "$nodes_json" | jq -r --arg node "$node_name" '[.records[] | select(.name == $node)] | length')
+  [ "$count" -gt 0 ]
+}
+
+prompt_node_name() {
+  local var_name=$1
+  local prompt_label=$2
+  local current_value=${!var_name:-}
+  local input_value
+  local nodes_json
+
+  while true; do
+    echo "Provide ? to list node names"
+    if [ -n "$current_value" ]; then
+      read -r -p "$prompt_label [$current_value]: " input_value
+    else
+      read -r -p "$prompt_label: " input_value
+    fi
+
+    input_value=$(normalize_input "$input_value")
+    if [ "$input_value" = "?" ]; then
+      nodes_json=$(get_nodes_json)
+      show_nodes "$nodes_json"
+      continue
+    fi
+
+    if [ -z "$input_value" ] && [ -n "$current_value" ]; then
+      input_value=$current_value
+    fi
+
+    if [ -z "$input_value" ]; then
+      echo "$var_name is required." >&2
+      continue
+    fi
+
+    nodes_json=$(get_nodes_json)
+    if ! node_exists "$input_value" "$nodes_json"; then
+      echo "Node '$input_value' was not found. Type ? to list available node names." >&2
+      continue
+    fi
+
+    printf -v "$var_name" '%s' "$input_value"
+    return
+  done
+}
+
+get_svm_routes_json() {
+  local encoded_svm
+  encoded_svm=$(uri_encode "$SVM")
+  api_request "GET" "https://$MGMT_IP/api/network/ip/routes?svm.name=$encoded_svm&fields=svm.name,destination,gateway&return_records=true&return_timeout=15&max_records=10000"
+}
+
+has_default_gateway_route() {
+  local routes_json=$1
+  local count
+  count=$(printf '%s' "$routes_json" | jq -r '
+    [
+      .records[]
+      | select(
+          ((.destination.network // .destination.cidr // "") == "0.0.0.0/0")
+          or
+          (
+            ((.destination.address // .destination.ip // "") == "0.0.0.0")
+            and
+            (
+              ((.destination.netmask // "") == "0.0.0.0")
+              or
+              ((.destination.prefix_length // -1) == 0)
+            )
+          )
+        )
+    ]
+    | length
+  ')
+  [ "$count" -gt 0 ]
+}
+
+create_default_gateway_route() {
+  local gateway_ip=$1
+  local payload
+
+  payload=$(jq -n \
+    --arg svm_name "$SVM" \
+    --arg gateway_ip "$gateway_ip" \
+    '{
+      svm: { name: $svm_name },
+      destination: {
+        address: "0.0.0.0",
+        netmask: "0.0.0.0"
+      },
+      gateway: $gateway_ip
+    }')
+
+  echo "Adding default gateway route ($gateway_ip) to SVM '$SVM'"
+  api_request "POST" "https://$MGMT_IP/api/network/ip/routes?return_timeout=0&return_records=false" "$payload" >/dev/null
+}
+
+ensure_default_gateway_for_svm() {
+  local routes_json
+  local add_gateway_choice
+  local gateway_input
+
+  routes_json=$(get_svm_routes_json)
+  if has_default_gateway_route "$routes_json"; then
+    echo "Default gateway route already exists for SVM '$SVM'."
+    return
+  fi
+
+  echo "No default gateway route found for SVM '$SVM'."
+  while true; do
+    read -r -p "Would you like to add a default gateway route now? [y/N]: " add_gateway_choice
+    add_gateway_choice=$(normalize_input "$add_gateway_choice")
+    add_gateway_choice=${add_gateway_choice,,}
+    case "$add_gateway_choice" in
+      y|yes)
+        while true; do
+          if [ -n "${DEFAULT_GATEWAY:-}" ]; then
+            read -r -p "Enter default gateway IP [$DEFAULT_GATEWAY]: " gateway_input
+          else
+            read -r -p "Enter default gateway IP: " gateway_input
+          fi
+          gateway_input=$(normalize_input "$gateway_input")
+          if [ -z "$gateway_input" ] && [ -n "${DEFAULT_GATEWAY:-}" ]; then
+            gateway_input=$DEFAULT_GATEWAY
+          fi
+          if ! is_valid_ipv4 "$gateway_input"; then
+            echo "Default gateway must be a valid IPv4 address." >&2
+            continue
+          fi
+          DEFAULT_GATEWAY=$gateway_input
+          create_default_gateway_route "$DEFAULT_GATEWAY"
+          return
+        done
+        ;;
+      ""|n|no)
+        echo "Continuing without creating a default gateway route."
+        return
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+}
+
 api_request() {
   local method=$1
   local url=$2
@@ -392,6 +567,7 @@ NODE2=${NODE2:-}
 DATA_PORT1=${DATA_PORT1:-}
 DATA_PORT2=${DATA_PORT2:-}
 DATA_IPS=${DATA_IPS:-}
+DEFAULT_GATEWAY=${DEFAULT_GATEWAY:-${DATA_GATEWAY:-}}
 
 if [ -z "$DATA_IPS" ]; then
   legacy_ips=()
@@ -409,6 +585,7 @@ fi
 prompt_if_empty MGMT_IP "Enter cluster management IP: "
 prompt_auth_token
 prompt_if_empty SVM "Enter SVM name: "
+ensure_default_gateway_for_svm
 
 while true; do
   if [ -n "$LIF_PREFIX" ]; then
@@ -446,8 +623,8 @@ while true; do
   break
 done
 
-prompt_if_empty NODE1 "Enter node 1 name: "
-prompt_if_empty NODE2 "Enter node 2 name: "
+prompt_node_name NODE1 "Enter node 1 name"
+prompt_node_name NODE2 "Enter node 2 name"
 prompt_if_empty DATA_PORT1 "Enter data port 1 name: "
 prompt_if_empty DATA_PORT2 "Enter data port 2 name: "
 
