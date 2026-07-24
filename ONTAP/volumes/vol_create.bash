@@ -119,7 +119,7 @@ Usage: vol_create.bash [--debug]
 
 Options:
   --debug   Enable verbose REST request/response tracing to a log file.
-            Default path: <volumes>/logs/vol_create_debug_YYYYmmdd_HHMMSS.log
+            Default path: <ONTAP/volumes>/logs/vol_create_debug_YYYYmmdd_HHMMSS.log
             Optional: set DEBUG_LOG_FILE=/path/to/file.log
 EOF
 }
@@ -156,6 +156,10 @@ parse_args() {
     esac
     shift
   done
+}
+
+uri_encode() {
+  jq -nr --arg value "$1" '$value|@uri'
 }
 
 display_volume_type() {
@@ -419,9 +423,69 @@ api_request() {
   printf '%s' "$body"
 }
 
+get_cluster_nodes_json() {
+  api_request "GET" "https://$MGMT_IP/api/cluster/nodes?fields=name&return_records=true&return_timeout=15&max_records=10000"
+}
+
+disable_volume_efficiency_benchmark() {
+  local volume_name=$1
+  local encoded_volume
+  local encoded_svm
+
+  encoded_volume=$(uri_encode "$volume_name")
+  encoded_svm=$(uri_encode "$SVM")
+
+  echo "Disabling volume efficiency on $volume_name"
+  api_request "POST" "https://$MGMT_IP/api/private/cli/volume/efficiency/off?volume=$encoded_volume&vserver=$encoded_svm&return_timeout=0&return_records=false" >/dev/null
+}
+
+apply_aggregate_efficiency_benchmark() {
+  local aggregate_name=$1
+  local encoded_aggregate
+
+  encoded_aggregate=$(uri_encode "$aggregate_name")
+
+  echo "Applying aggregate efficiency benchmark settings on $aggregate_name"
+  api_request "PATCH" "https://$MGMT_IP/api/private/cli/aggr/efficiency/modify?aggregate=$encoded_aggregate&cross-volume-background-dedupe=false&cross-volume-inline-dedupe=false&return_timeout=0&return_records=false" >/dev/null
+  api_request "PATCH" "https://$MGMT_IP/api/private/cli/aggr/efficiency/wise-tsse/modify?aggregate=$encoded_aggregate&enable-workload-informed-tsse=false&return_timeout=0&return_records=false" >/dev/null
+}
+
+apply_benchmark_post_create_settings() {
+  local aggregate_json
+  local aggregate_name
+  local matched=false
+  local created_volume
+
+  for created_volume in "${CREATED_VOLUMES[@]}"; do
+    disable_volume_efficiency_benchmark "$created_volume"
+  done
+
+  aggregate_json=$(api_request "GET" "https://$MGMT_IP/api/storage/aggregates?fields=name&return_records=true&return_timeout=15&max_records=10000")
+  while IFS= read -r aggregate_name; do
+    if [ -z "$aggregate_name" ]; then
+      continue
+    fi
+    matched=true
+    apply_aggregate_efficiency_benchmark "$aggregate_name"
+  done < <(printf '%s' "$aggregate_json" | jq -r '.records[].name // empty' | grep '^data' || true)
+
+  if [ "$matched" = "false" ]; then
+    echo "No aggregates matching 'data*' were found for aggregate benchmark settings."
+  fi
+}
+
 build_payload() {
   local volume_name=$1
   local volume_path="/$volume_name"
+  local benchmark_enabled_json=false
+  local aggressive_readahead_json=false
+
+  if [ "$ENABLE_BENCHMARK_BEST_PRACTICES" = "true" ]; then
+    benchmark_enabled_json=true
+  fi
+  if [ "$ENABLE_AGGRESSIVE_READAHEAD" = "true" ]; then
+    aggressive_readahead_json=true
+  fi
 
   if [ "$VOLUME_STYLE" = "flexgroup" ]; then
     jq -n \
@@ -429,6 +493,8 @@ build_payload() {
       --arg svm "$SVM" \
       --arg path "$volume_path" \
       --argjson size "$VOL_SIZE_BYTES" \
+      --argjson benchmark_enabled "$benchmark_enabled_json" \
+      --argjson aggressive_readahead "$aggressive_readahead_json" \
       '{
         constituent_count: 32,
         guarantee: { type: "none" },
@@ -437,21 +503,38 @@ build_payload() {
           export_policy: { name: "default" },
           junction_parent: { name: $svm },
           path: $path,
-          security_style: "unix",
-          unix_permissions: 777
+          security_style: "unix"
         },
         size: $size,
-        space: { large_size_enabled: true },
         style: "flexgroup",
         svm: { name: $svm },
         type: "rw"
-      }'
+      }
+      | if $benchmark_enabled then
+          .space.large_size_enabled = true
+          | .files.set_maximum = true
+          | .snapshot_policy.name = "none"
+          | .autosize.mode = "grow_shrink"
+          | .nas.unix_permissions = 777
+          | .analytics.state = "off"
+          | .nas.snapdir_access = false
+          | .nas.maxdir_size = "4G"
+        else
+          .
+        end
+      | if $aggressive_readahead then
+          .aggressive_readahead_mode = "cross_file_sequential_read"
+        else
+          .
+        end'
   else
     jq -n \
       --arg name "$volume_name" \
       --arg svm "$SVM" \
       --arg path "$volume_path" \
       --argjson size "$VOL_SIZE_BYTES" \
+      --argjson benchmark_enabled "$benchmark_enabled_json" \
+      --argjson aggressive_readahead "$aggressive_readahead_json" \
       '{
         guarantee: { type: "none" },
         name: $name,
@@ -459,14 +542,30 @@ build_payload() {
           export_policy: { name: "default" },
           junction_parent: { name: $svm },
           path: $path,
-          security_style: "unix",
-          unix_permissions: 777
+          security_style: "unix"
         },
         size: $size,
         style: "flexvol",
         svm: { name: $svm },
         type: "rw"
-      }'
+      }
+      | if $benchmark_enabled then
+          .space.large_size_enabled = true
+          | .files.set_maximum = true
+          | .snapshot_policy.name = "none"
+          | .autosize.mode = "grow_shrink"
+          | .nas.unix_permissions = 777
+          | .analytics.state = "off"
+          | .nas.snapdir_access = false
+          | .nas.maxdir_size = "4G"
+        else
+          .
+        end
+      | if $aggressive_readahead then
+          .aggressive_readahead_mode = "cross_file_sequential_read"
+        else
+          .
+        end'
   fi
 }
 
@@ -521,6 +620,8 @@ VOL_NAME_PREFIX=${VOL_NAME_PREFIX:-}
 NUM_VOLS=${NUM_VOLS:-}
 VOL_SIZE_TB=${VOL_SIZE_TB:-}
 VOLUME_STYLE=${VOLUME_STYLE:-}
+ENABLE_BENCHMARK_BEST_PRACTICES=${ENABLE_BENCHMARK_BEST_PRACTICES:-false}
+ENABLE_AGGRESSIVE_READAHEAD=${ENABLE_AGGRESSIVE_READAHEAD:-false}
 
 prompt_if_empty MGMT_IP "Enter cluster management IP: "
 prompt_auth_token
@@ -539,6 +640,15 @@ if ! is_positive_integer "$CAPACITY_TB"; then
   echo "Cluster reported insufficient capacity (<1 TB)." >&2
   exit 1
 fi
+
+nodes_json=$(get_cluster_nodes_json)
+CLUSTER_NODE_COUNT=$(printf '%s' "$nodes_json" | jq -r '.num_records // ([.records[]] | length)')
+if ! is_positive_integer "$CLUSTER_NODE_COUNT"; then
+  echo "Could not determine cluster node count from API response." >&2
+  exit 1
+fi
+
+BENCHMARK_MIN_VOL_SIZE_TB=$((CLUSTER_NODE_COUNT))
 
 if [ -n "$VOLUME_STYLE" ]; then
   VOLUME_STYLE=$(normalize_input "$VOLUME_STYLE")
@@ -607,10 +717,74 @@ while true; do
   done
 
   while true; do
-    if [ -n "$VOL_SIZE_TB" ]; then
-      read -r -p "Enter volume size in TB (2..$CAPACITY_TB) [$VOL_SIZE_TB]: " size_input
+    if [ "$ENABLE_BENCHMARK_BEST_PRACTICES" = "true" ]; then
+      benchmark_prompt_default="y"
     else
-      read -r -p "Enter volume size in TB (2..$CAPACITY_TB): " size_input
+      benchmark_prompt_default="n"
+    fi
+    echo "NOTE: This configuration is intended for performance benchmarking. Some of the features may be applicable to your production workloads, but you should engage your NetApp sales team to confirm."
+    read -r -p "Do you want to configure the volume for benchmarking best practices? (y/n) [$benchmark_prompt_default]: " benchmark_choice
+    benchmark_choice=$(normalize_input "$benchmark_choice")
+    benchmark_choice=${benchmark_choice,,}
+    if [ -z "$benchmark_choice" ]; then
+      benchmark_choice=$benchmark_prompt_default
+    fi
+    case "$benchmark_choice" in
+      y|yes)
+        ENABLE_BENCHMARK_BEST_PRACTICES=true
+        while true; do
+          if [ "$ENABLE_AGGRESSIVE_READAHEAD" = "true" ]; then
+            read -r -p "Do you want to enable aggressive readahead? [Y/n]: " readahead_choice
+          else
+            read -r -p "Do you want to enable aggressive readahead? [y/N]: " readahead_choice
+          fi
+          readahead_choice=$(normalize_input "$readahead_choice")
+          readahead_choice=${readahead_choice,,}
+          if [ -z "$readahead_choice" ]; then
+            if [ "$ENABLE_AGGRESSIVE_READAHEAD" = "true" ]; then
+              readahead_choice="y"
+            else
+              readahead_choice="n"
+            fi
+          fi
+          case "$readahead_choice" in
+            y|yes)
+              ENABLE_AGGRESSIVE_READAHEAD=true
+              break
+              ;;
+            n|no)
+              ENABLE_AGGRESSIVE_READAHEAD=false
+              break
+              ;;
+            *)
+              echo "Please enter y or n." >&2
+              ;;
+          esac
+        done
+        break
+        ;;
+      n|no)
+        ENABLE_BENCHMARK_BEST_PRACTICES=false
+        ENABLE_AGGRESSIVE_READAHEAD=false
+        break
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+
+  min_volume_size_tb=2
+  if [ "$ENABLE_BENCHMARK_BEST_PRACTICES" = "true" ] && [ "$BENCHMARK_MIN_VOL_SIZE_TB" -gt "$min_volume_size_tb" ]; then
+    min_volume_size_tb=$BENCHMARK_MIN_VOL_SIZE_TB
+    echo "Benchmark minimum volume size is $min_volume_size_tb TB (10 x 100G x $CLUSTER_NODE_COUNT cluster node(s))."
+  fi
+
+  while true; do
+    if [ -n "$VOL_SIZE_TB" ]; then
+      read -r -p "Enter volume size in TB ($min_volume_size_tb..$CAPACITY_TB) [$VOL_SIZE_TB]: " size_input
+    else
+      read -r -p "Enter volume size in TB ($min_volume_size_tb..$CAPACITY_TB): " size_input
     fi
     size_input=$(normalize_input "$size_input")
     if [ -z "$size_input" ] && [ -n "$VOL_SIZE_TB" ]; then
@@ -620,8 +794,8 @@ while true; do
       echo "Volume size must be a positive integer (TB)." >&2
       continue
     fi
-    if [ "$size_input" -lt 2 ] || [ "$size_input" -gt "$CAPACITY_TB" ]; then
-      echo "Volume size must be between 2 and $CAPACITY_TB TB." >&2
+    if [ "$size_input" -lt "$min_volume_size_tb" ] || [ "$size_input" -gt "$CAPACITY_TB" ]; then
+      echo "Volume size must be between $min_volume_size_tb and $CAPACITY_TB TB." >&2
       continue
     fi
     VOL_SIZE_TB=$size_input
@@ -672,6 +846,10 @@ while [ "$created_count" -lt "$NUM_VOLS" ]; do
   fi
   next_suffix=$((next_suffix + 1))
 done
+
+if [ "$ENABLE_BENCHMARK_BEST_PRACTICES" = "true" ]; then
+  apply_benchmark_post_create_settings
+fi
 
 echo "Done. Created $NUM_VOLS ${volume_type_display} volume(s) of size ${VOL_SIZE_TB} TB."
 
