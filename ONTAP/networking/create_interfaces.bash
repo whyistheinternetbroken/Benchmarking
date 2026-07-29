@@ -5,6 +5,8 @@ set -euo pipefail
 DEBUG=${DEBUG:-false}
 DEBUG_LOG_FILE=${DEBUG_LOG_FILE:-}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+API_LAST_HTTP_CODE=""
+API_LAST_RESPONSE_BODY=""
 
 require_command() {
   local cmd=$1
@@ -1282,6 +1284,7 @@ has_default_gateway_route() {
 create_default_gateway_route() {
   local gateway_ip=$1
   local payload
+  local response_body
 
   payload=$(jq -n \
     --arg svm_name "$SVM" \
@@ -1296,13 +1299,31 @@ create_default_gateway_route() {
     }')
 
   echo "Adding default gateway route ($gateway_ip) to SVM '$SVM'"
-  api_request "POST" "https://$MGMT_IP/api/network/ip/routes?return_timeout=0&return_records=false" "$payload" >/dev/null
+  if response_body=$(api_request "POST" "https://$MGMT_IP/api/network/ip/routes?return_timeout=0&return_records=false" "$payload" "allow_http_error"); then
+    return 0
+  fi
+
+  if [ "$API_LAST_HTTP_CODE" = "409" ] && printf '%s' "$response_body" | jq -e '
+      ((.error.code // "" | tostring) == "1966345")
+      or
+      ((.error.message // "") | test("Duplicate route exists\\."; "i"))
+    ' >/dev/null 2>&1; then
+    echo "A duplicate default route already exists in SVM '$SVM'."
+    return 3
+  fi
+
+  echo "API request failed (POST https://$MGMT_IP/api/network/ip/routes?return_timeout=0&return_records=false): HTTP $API_LAST_HTTP_CODE" >&2
+  if [ -n "$response_body" ]; then
+    echo "$response_body" >&2
+  fi
+  exit 1
 }
 
 ensure_default_gateway_for_svm() {
   local routes_json
   local add_gateway_choice
   local gateway_input
+  local route_create_rc
 
   routes_json=$(get_svm_routes_json)
   if has_default_gateway_route "$routes_json"; then
@@ -1340,8 +1361,36 @@ ensure_default_gateway_for_svm() {
             continue
           fi
           DEFAULT_GATEWAY=$gateway_input
-          create_default_gateway_route "$DEFAULT_GATEWAY"
-          return
+          if create_default_gateway_route "$DEFAULT_GATEWAY"; then
+            return
+          else
+            route_create_rc=$?
+          fi
+
+          if [ "$route_create_rc" -eq 3 ]; then
+            while true; do
+              read -r -p "Duplicate route exists. Omit default route creation and continue? [y/N]: " add_gateway_choice
+              add_gateway_choice=$(normalize_input "$add_gateway_choice")
+              if is_back_command "$add_gateway_choice"; then
+                break
+              fi
+              add_gateway_choice=${add_gateway_choice,,}
+              case "$add_gateway_choice" in
+                y|yes)
+                  echo "Continuing without creating a default gateway route."
+                  return
+                  ;;
+                ""|n|no)
+                  echo "Okay, please enter a different default gateway IP."
+                  break
+                  ;;
+                *)
+                  echo "Please enter y or n." >&2
+                  ;;
+              esac
+            done
+            continue
+          fi
         done
         ;;
       ""|n|no)
@@ -1359,6 +1408,7 @@ api_request() {
   local method=$1
   local url=$2
   local payload=${3:-}
+  local allow_http_error=${4:-false}
   local response
   local response_no_time
   local http_code
@@ -1391,8 +1441,14 @@ api_request() {
 
   debug_log "Response: HTTP $http_code (${time_total}s) for $method $url"
   debug_print_json "Response body" "$body"
+  API_LAST_HTTP_CODE=$http_code
+  API_LAST_RESPONSE_BODY=$body
 
   if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    if [ "$allow_http_error" = "allow_http_error" ]; then
+      printf '%s' "$body"
+      return 1
+    fi
     echo "API request failed ($method $url): HTTP $http_code" >&2
     if [ -n "$body" ]; then
       echo "$body" >&2
