@@ -77,6 +77,11 @@ normalize_input() {
   printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+is_protected_root_volume() {
+  local volume_name=$1
+  [ "$volume_name" = "vsroot" ] || [[ "$volume_name" == *_root ]]
+}
+
 debug_log() {
   if [ "$DEBUG" != "true" ]; then
     return
@@ -495,7 +500,7 @@ resolve_target_volumes() {
   fi
 
   while IFS=$'\t' read -r name uuid state path; do
-    if [ "$name" = "vsroot" ]; then
+    if is_protected_root_volume "$name"; then
       continue
     fi
 
@@ -618,7 +623,7 @@ show_rest_translation_notes
 volumes_json=$(get_svm_volumes_json "$SVM")
 
 while true; do
-  read -r -p "Do you want to delete all volumes in the SVM (except vsroot)? [y/N]: " delete_all_choice
+  read -r -p "Do you want to delete all volumes in the SVM (except vsroot and *_root)? [y/N]: " delete_all_choice
   delete_all_choice=$(normalize_input "$delete_all_choice")
   delete_all_choice=${delete_all_choice,,}
 
