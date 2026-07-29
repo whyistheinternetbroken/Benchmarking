@@ -9,6 +9,7 @@ This folder contains ONTAP REST API Bash wizards for interface lifecycle tasks.
   - Supports static IPs or subnet-based dynamic provisioning
   - Supports multi-node and per-node multiplier workflows
   - Supports data port selection, wildcard families (for example `e2`), and optional ping tests
+  - Supports optional RDMA enablement on created interfaces (`rdma_protocols: ["roce"]`)
 
 - `cleanup_interfaces.bash`
   - Interactive cleanup for:

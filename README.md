@@ -18,8 +18,15 @@ All ONTAP-focused scripts are organized under `ONTAP/`.
 - `create_interfaces.bash`
   - Interactive LIF creation workflow.
   - Supports static IP and subnet-based interface provisioning.
+  - Supports optional RDMA enablement for created interfaces.
 - `cleanup_interfaces.bash`
   - Interactive cleanup workflow for interfaces, subnets, and default routes.
+
+### `ONTAP/NAS/`
+
+- `configure_NFS.bash`
+  - Interactive create/modify workflow for SVM NFS server configuration.
+  - Supports NFS protocol version selection, optional NFSv4 ID domain, benchmarking profile settings, and RDMA workflows.
 
 ## Common requirements
 

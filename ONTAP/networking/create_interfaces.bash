@@ -124,7 +124,7 @@ Options:
 Environment variables (optional):
   MGMT_IP, AUTH_TOK, SVM, LIF_PREFIX, LIFS_PER_NODE
   DATA_PORTS, DATA_PORT_FAMILIES, DATA_MASK, DATA_IPS
-  USE_SUBNET_DYNAMIC, SUBNET_NAME
+  USE_SUBNET_DYNAMIC, SUBNET_NAME, ENABLE_RDMA
 
 Prompt tips:
   - Type ? in lookup prompts to list available objects.
@@ -1672,26 +1672,50 @@ build_payload_static() {
   local node_name=$3
   local port_name=$4
 
-  jq -n \
-    --arg lif_name "$lif_name" \
-    --arg svm_name "$SVM" \
-    --arg ip_address "$data_ip" \
-    --arg data_mask "$DATA_MASK" \
-    --arg node_name "$node_name" \
-    --arg port_name "$port_name" \
-    '{
-      name: $lif_name,
-      scope: "svm",
-      svm: { name: $svm_name },
-      ip: {
-        address: $ip_address,
-        netmask: $data_mask
-      },
-      location: {
-        home_node: $node_name,
-        home_port: $port_name
-      }
-    }'
+  if [ "$ENABLE_RDMA" = "true" ]; then
+    jq -n \
+      --arg lif_name "$lif_name" \
+      --arg svm_name "$SVM" \
+      --arg ip_address "$data_ip" \
+      --arg data_mask "$DATA_MASK" \
+      --arg node_name "$node_name" \
+      --arg port_name "$port_name" \
+      '{
+        name: $lif_name,
+        scope: "svm",
+        svm: { name: $svm_name },
+        ip: {
+          address: $ip_address,
+          netmask: $data_mask
+        },
+        location: {
+          home_node: $node_name,
+          home_port: $port_name
+        },
+        rdma_protocols: ["roce"]
+      }'
+  else
+    jq -n \
+      --arg lif_name "$lif_name" \
+      --arg svm_name "$SVM" \
+      --arg ip_address "$data_ip" \
+      --arg data_mask "$DATA_MASK" \
+      --arg node_name "$node_name" \
+      --arg port_name "$port_name" \
+      '{
+        name: $lif_name,
+        scope: "svm",
+        svm: { name: $svm_name },
+        ip: {
+          address: $ip_address,
+          netmask: $data_mask
+        },
+        location: {
+          home_node: $node_name,
+          home_port: $port_name
+        }
+      }'
+  fi
 }
 
 build_payload_dynamic() {
@@ -1699,22 +1723,42 @@ build_payload_dynamic() {
   local node_name=$2
   local port_name=$3
 
-  jq -n \
-    --arg lif_name "$lif_name" \
-    --arg svm_name "$SVM" \
-    --arg subnet_name "$SUBNET_NAME" \
-    --arg node_name "$node_name" \
-    --arg port_name "$port_name" \
-    '{
-      name: $lif_name,
-      scope: "svm",
-      svm: { name: $svm_name },
-      subnet: { name: $subnet_name },
-      location: {
-        home_node: $node_name,
-        home_port: $port_name
-      }
-    }'
+  if [ "$ENABLE_RDMA" = "true" ]; then
+    jq -n \
+      --arg lif_name "$lif_name" \
+      --arg svm_name "$SVM" \
+      --arg subnet_name "$SUBNET_NAME" \
+      --arg node_name "$node_name" \
+      --arg port_name "$port_name" \
+      '{
+        name: $lif_name,
+        scope: "svm",
+        svm: { name: $svm_name },
+        subnet: { name: $subnet_name },
+        location: {
+          home_node: $node_name,
+          home_port: $port_name
+        },
+        rdma_protocols: ["roce"]
+      }'
+  else
+    jq -n \
+      --arg lif_name "$lif_name" \
+      --arg svm_name "$SVM" \
+      --arg subnet_name "$SUBNET_NAME" \
+      --arg node_name "$node_name" \
+      --arg port_name "$port_name" \
+      '{
+        name: $lif_name,
+        scope: "svm",
+        svm: { name: $svm_name },
+        subnet: { name: $subnet_name },
+        location: {
+          home_node: $node_name,
+          home_port: $port_name
+        }
+      }'
+  fi
 }
 
 create_lif_static() {
@@ -2040,6 +2084,40 @@ prompt_data_port_strategy() {
   done
 }
 
+prompt_enable_rdma() {
+  local rdma_choice
+
+  while true; do
+    print_hint "Type B to go back to previous question."
+    if [ "$ENABLE_RDMA" = "true" ]; then
+      read -r -p "Enable RDMA for these interfaces? [Y/n]: " rdma_choice
+    else
+      read -r -p "Enable RDMA for these interfaces? [y/N]: " rdma_choice
+    fi
+    rdma_choice=$(normalize_input "$rdma_choice")
+    if is_back_command "$rdma_choice"; then
+      return 2
+    fi
+    rdma_choice=${rdma_choice,,}
+    case "$rdma_choice" in
+      y|yes)
+        ENABLE_RDMA=true
+        return
+        ;;
+      n|no)
+        ENABLE_RDMA=false
+        return
+        ;;
+      "")
+        return
+        ;;
+      *)
+        echo "Please enter y or n." >&2
+        ;;
+    esac
+  done
+}
+
 prompt_subnet_dynamic_choice() {
   local use_subnet_choice
 
@@ -2179,6 +2257,9 @@ show_interface_plan() {
 
   echo
   echo "Interfaces to create in SVM '$SVM':"
+  if [ "$ENABLE_RDMA" = "true" ]; then
+    echo "  - RDMA protocol will be enabled (roce)."
+  fi
   for idx in "${!PLANNED_NAMES[@]}"; do
     if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
       echo "  - ${PLANNED_NAMES[$idx]} (subnet: $SUBNET_NAME) on ${PLANNED_NODES[$idx]}/${PLANNED_PORTS[$idx]}"
@@ -2247,6 +2328,13 @@ BALANCE_ACROSS_PORTS=${BALANCE_ACROSS_PORTS:-false}
 USE_PORT_FAMILY_BALANCING=${USE_PORT_FAMILY_BALANCING:-false}
 DEFAULT_GATEWAY=${DEFAULT_GATEWAY:-${DATA_GATEWAY:-}}
 BROADCAST_DOMAINS_PORTS_JSON=${BROADCAST_DOMAINS_PORTS_JSON:-}
+ENABLE_RDMA=${ENABLE_RDMA:-false}
+
+ENABLE_RDMA=$(normalize_input "$ENABLE_RDMA")
+ENABLE_RDMA=${ENABLE_RDMA,,}
+if [ "$ENABLE_RDMA" != "true" ]; then
+  ENABLE_RDMA=false
+fi
 
 if [ -z "$DATA_IPS" ]; then
   legacy_ips=()
@@ -2383,13 +2471,27 @@ while true; do
         rc=$?
       fi
       if [ "$rc" -eq 0 ]; then
-        wizard_step="default_gateway"
+        wizard_step="rdma"
       elif [ "$rc" -eq 2 ]; then
         if [ "$USE_SUBNET_DYNAMIC" = "true" ]; then
           wizard_step="subnet"
         else
           wizard_step="static_networking"
         fi
+      else
+        exit "$rc"
+      fi
+      ;;
+    rdma)
+      if prompt_enable_rdma; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 0 ]; then
+        wizard_step="default_gateway"
+      elif [ "$rc" -eq 2 ]; then
+        wizard_step="ports"
       else
         exit "$rc"
       fi
@@ -2403,7 +2505,7 @@ while true; do
       if [ "$rc" -eq 0 ]; then
         wizard_step="confirm"
       elif [ "$rc" -eq 2 ]; then
-        wizard_step="ports"
+        wizard_step="rdma"
       else
         exit "$rc"
       fi
